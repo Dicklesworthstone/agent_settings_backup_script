@@ -261,10 +261,12 @@ backup_agent() {
             "$source/" "$dest/" 2>/dev/null
     else
         # Fallback to cp
-        # First, remove files that no longer exist in source
+        # First, remove files that no longer exist in source (except .git and .gitignore)
         find "$dest" -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.gitignore' -exec rm -rf {} \; 2>/dev/null
-        # Then copy
-        cp -r "$source"/* "$dest/" 2>/dev/null || true
+        # Then copy (use /. to include hidden files)
+        cp -r "$source"/. "$dest/" 2>/dev/null || true
+        # Remove .git if it was copied from source (we want to keep our own)
+        rm -rf "$dest/.git" 2>/dev/null || true
     fi
 
     # Create commit if auto-commit is enabled
@@ -362,8 +364,11 @@ restore_agent() {
             --exclude='.gitignore' \
             "$source/" "$dest/" 2>/dev/null
     else
-        rm -rf "$dest"/* 2>/dev/null
-        cp -r "$source"/* "$dest/" 2>/dev/null || true
+        # Remove existing files (but preserve structure for hidden files)
+        find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} \; 2>/dev/null
+        # Copy all files including hidden ones (use /. to include dotfiles)
+        cp -r "$source"/. "$dest/" 2>/dev/null || true
+        # Remove .git and .gitignore that came from backup (shouldn't be in destination)
         rm -rf "$dest/.git" "$dest/.gitignore" 2>/dev/null
     fi
 
@@ -392,6 +397,8 @@ list_backups() {
     printf '%-15s %-20s %-10s %-20s\n' "Agent" "Name" "Status" "Last Backup" >&2
     printf '%s\n' "────────────────────────────────────────────────────────────" >&2
 
+    # Collect output lines for sorting
+    local output_lines=()
     for agent in "${!AGENT_FOLDERS[@]}"; do
         local agent_name="${AGENT_NAMES[$agent]:-$agent}"
         local source
@@ -411,8 +418,11 @@ list_backups() {
             last_backup=$(git -C "$dest" log -1 --format="%ar" 2>/dev/null || echo "unknown")
         fi
 
-        printf "%-15s %-20s %-10b %-20s\n" "$agent" "$agent_name" "$status" "$last_backup" >&2
-    done | sort >&2
+        output_lines+=("$(printf "%-15s %-20s %-10b %-20s" "$agent" "$agent_name" "$status" "$last_backup")")
+    done
+
+    # Sort and print
+    printf '%s\n' "${output_lines[@]}" | sort >&2
 
     printf '\n' >&2
     printf "Backup location: %s\n" "$backup_root" >&2
@@ -479,10 +489,10 @@ show_diff() {
     # Create a temp copy of current state
     local temp_dir
     temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
+    trap "rm -rf '$temp_dir'" RETURN
 
-    # Copy current source to temp
-    cp -r "$source"/* "$temp_dir/" 2>/dev/null || true
+    # Copy current source to temp (use /. to include hidden files)
+    cp -r "$source"/. "$temp_dir/" 2>/dev/null || true
 
     # Compare with backup
     diff -rq "$dest" "$temp_dir" \

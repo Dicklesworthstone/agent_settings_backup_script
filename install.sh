@@ -127,13 +127,18 @@ download_file() {
 
 install_from_main() {
     local install_dir="$1"
-    local temp_dir
+    local temp_dir="${2:-}"
 
-    if ! temp_dir=$(mktemp_dir); then
-        log_error "Failed to create temp directory"
-        return 1
+    # Only create temp_dir if not provided (avoid nested traps)
+    local owns_temp=false
+    if [[ -z "$temp_dir" ]]; then
+        if ! temp_dir=$(mktemp_dir); then
+            log_error "Failed to create temp directory"
+            return 1
+        fi
+        owns_temp=true
+        trap "rm -rf '$temp_dir'" EXIT
     fi
-    trap "rm -rf '$temp_dir'" EXIT
 
     log_warn "Installing from main branch."
     echo "" >&2
@@ -165,7 +170,8 @@ install_from_latest_release() {
     log_step "Downloading asb (latest release)..."
     if ! download_file "$script_url" "$temp_dir/$SCRIPT_NAME"; then
         log_warn "Could not download from latest release, falling back to main branch"
-        install_from_main "$install_dir"
+        # Pass temp_dir to avoid nested trap issues
+        install_from_main "$install_dir" "$temp_dir"
         return $?
     fi
 
@@ -174,7 +180,8 @@ install_from_latest_release() {
     IFS= read -r first_line < "$temp_dir/$SCRIPT_NAME" 2>/dev/null || true
     if [[ "$first_line" != "#!/usr/bin/env bash" ]]; then
         log_warn "Downloaded unexpected content, falling back to main branch"
-        install_from_main "$install_dir"
+        # Pass temp_dir to avoid nested trap issues
+        install_from_main "$install_dir" "$temp_dir"
         return $?
     fi
 
