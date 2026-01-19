@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create checksums
+        run: |
+          sha256sum asb > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            asb
+            checksums.txt
+          body: |
+            ## Agent Settings Backup v${{ steps.version.outputs.version }}
+
+            ### Installation
+
+            ```bash
+            curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh" | bash
+            ```
+
+            ### What's Changed
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+
+      - name: Verify release artifacts
+        run: |
+          echo "Release created for v${{ steps.version.outputs.version }}"
+          ls -la asb checksums.txt

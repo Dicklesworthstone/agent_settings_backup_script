@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+#
+# asb - Agent Settings Backup
+# Backs up AI coding agent configuration folders to git-versioned repositories
+#
+# Each agent type gets its own git repository in the backup location, enabling:
+#   - Full history tracking of configuration changes
+#   - Easy restoration to any point in time
+#   - Diffing between backup snapshots
+#
+# Supported agents:
+#   claude, codex, cursor, gemini, cline, amp, aider, opencode, factory, windsurf
+#
+# Usage:
+#   asb backup              Backup all detected agents
+#   asb backup claude       Backup specific agent(s)
+#   asb restore claude      Restore agent from backup
+#   asb list                List all backups with status
+#   asb history claude      Show backup history for an agent
+#   asb diff claude         Show diff since last backup
+#   asb init                Initialize backup location
+#
+# Environment:
+#   ASB_BACKUP_ROOT         Backup location (default: ~/.agent_settings_backups)
+#   ASB_AUTO_COMMIT         Auto-commit on backup (default: true)
+#   ASB_VERBOSE             Verbose output (default: false)
+#
+# Repository: https://github.com/Dicklesworthstone/agent_settings_backup_script
+# License: MIT
+#
+#==============================================================================
+
+set -uo pipefail
+
+#==============================================================================
+# VERSION
+#==============================================================================
+
+ASB_VERSION="0.1.0"
+
+#==============================================================================
+# CONSTANTS
+#==============================================================================
+
+# Default backup location
+DEFAULT_BACKUP_ROOT="${HOME}/.agent_settings_backups"
+
+# Agent definitions: name -> source folder (relative to HOME)
+declare -A AGENT_FOLDERS=(
+    [claude]=".claude"
+    [codex]=".codex"
+    [cursor]=".cursor"
+    [gemini]=".gemini"
+    [cline]=".cline"
+    [amp]=".amp"
+    [aider]=".aider"
+    [opencode]=".opencode"
+    [factory]=".factory"
+    [windsurf]=".windsurf"
+)
+
+# Human-readable agent names
+declare -A AGENT_NAMES=(
+    [claude]="Claude Code"
+    [codex]="OpenAI Codex CLI"
+    [cursor]="Cursor"
+    [gemini]="Google Gemini"
+    [cline]="Cline"
+    [amp]="Amp (Sourcegraph)"
+    [aider]="Aider"
+    [opencode]="OpenCode"
+    [factory]="Factory Droid"
+    [windsurf]="Windsurf"
+)
+
+#==============================================================================
+# COLORS
+#==============================================================================
+
+if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    RESET='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' RESET=''
+fi
+
+#==============================================================================
+# LOGGING
+#==============================================================================
+
+log_info() { printf '%b\n' "${BLUE}ℹ${RESET} $*" >&2; }
+log_success() { printf '%b\n' "${GREEN}✓${RESET} $*" >&2; }
+log_warn() { printf '%b\n' "${YELLOW}⚠${RESET} $*" >&2; }
+log_error() { printf '%b\n' "${RED}✗${RESET} $*" >&2; }
+log_step() { printf '%b\n' "${CYAN}→${RESET} $*" >&2; }
+log_debug() { [[ "${ASB_VERBOSE:-false}" == "true" ]] && printf '%b\n' "${DIM}  $*${RESET}" >&2 || true; }
+
+#==============================================================================
+# UTILITIES
+#==============================================================================
+
+command_exists() {
+    command -v "$1" &>/dev/null
+}
+
+get_backup_root() {
+    local root="${ASB_BACKUP_ROOT:-$DEFAULT_BACKUP_ROOT}"
+    # Expand ~ if present
+    echo "${root/#\~/$HOME}"
+}
+
+get_agent_source() {
+    local agent="$1"
+    local folder="${AGENT_FOLDERS[$agent]:-}"
+    [[ -n "$folder" ]] && echo "${HOME}/${folder}"
+}
+
+get_agent_backup_dir() {
+    local agent="$1"
+    local folder="${AGENT_FOLDERS[$agent]:-}"
+    [[ -n "$folder" ]] && echo "$(get_backup_root)/${folder}"
+}
+
+agent_exists() {
+    local agent="$1"
+    [[ -n "${AGENT_FOLDERS[$agent]:-}" ]]
+}
+
+agent_source_exists() {
+    local agent="$1"
+    local source
+    source=$(get_agent_source "$agent")
+    [[ -n "$source" && -d "$source" ]]
+}
+
+#==============================================================================
+# GIT OPERATIONS
+#==============================================================================
+
+init_git_repo() {
+    local dir="$1"
+    local agent="$2"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+
+    if [[ ! -d "$dir/.git" ]]; then
+        log_step "Initializing git repository for ${agent_name}..."
+        git -C "$dir" init --initial-branch=main >/dev/null 2>&1 || git -C "$dir" init >/dev/null 2>&1
+
+        # Create .gitignore for common exclusions
+        cat > "$dir/.gitignore" << 'EOF'
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large binary caches (agent-specific)
+**/cache/
+**/Cache/
+**/.cache/
+
+# Session files that may be large
+*.sqlite3-wal
+*.sqlite3-shm
+EOF
+
+        # Initial commit
+        git -C "$dir" add -A >/dev/null 2>&1
+        git -C "$dir" commit -m "Initial backup of ${agent_name} settings" --allow-empty >/dev/null 2>&1
+        log_success "Git repository initialized"
+    fi
+}
+
+create_backup_commit() {
+    local dir="$1"
+    local agent="$2"
+    local message="${3:-}"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+
+    # Check for changes
+    if git -C "$dir" diff --quiet HEAD 2>/dev/null && git -C "$dir" diff --staged --quiet 2>/dev/null; then
+        # Check for untracked files
+        if [[ -z "$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+            log_info "No changes detected for ${agent_name}"
+            return 0
+        fi
+    fi
+
+    # Stage all changes
+    git -C "$dir" add -A >/dev/null 2>&1
+
+    # Generate commit message if not provided
+    if [[ -z "$message" ]]; then
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local changed_files
+        changed_files=$(git -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+        message="Backup ${agent_name}: ${timestamp} (${changed_files} files changed)"
+    fi
+
+    # Commit
+    git -C "$dir" commit -m "$message" >/dev/null 2>&1
+    log_success "Created backup commit for ${agent_name}"
+
+    # Show brief summary
+    local commit_hash
+    commit_hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+    log_debug "Commit: ${commit_hash}"
+}
+
+#==============================================================================
+# BACKUP OPERATIONS
+#==============================================================================
+
+backup_agent() {
+    local agent="$1"
+    local source
+    local dest
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+
+    source=$(get_agent_source "$agent")
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$source" ]]; then
+        log_warn "${agent_name} not found at ${source}"
+        return 1
+    fi
+
+    log_step "Backing up ${agent_name}..."
+    log_debug "Source: ${source}"
+    log_debug "Destination: ${dest}"
+
+    # Create backup directory if needed
+    mkdir -p "$dest"
+
+    # Initialize git repo if needed
+    init_git_repo "$dest" "$agent"
+
+    # Sync files using rsync for efficiency
+    if command_exists rsync; then
+        rsync -a --delete \
+            --exclude='.git' \
+            --exclude='*.log' \
+            --exclude='cache/' \
+            --exclude='Cache/' \
+            --exclude='.cache/' \
+            --exclude='*.sqlite3-wal' \
+            --exclude='*.sqlite3-shm' \
+            "$source/" "$dest/" 2>/dev/null
+    else
+        # Fallback to cp
+        # First, remove files that no longer exist in source
+        find "$dest" -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.gitignore' -exec rm -rf {} \; 2>/dev/null
+        # Then copy
+        cp -r "$source"/* "$dest/" 2>/dev/null || true
+    fi
+
+    # Create commit if auto-commit is enabled
+    if [[ "${ASB_AUTO_COMMIT:-true}" == "true" ]]; then
+        create_backup_commit "$dest" "$agent"
+    fi
+
+    return 0
+}
+
+backup_all() {
+    local agents=("$@")
+    local backed_up=0
+    local failed=0
+    local skipped=0
+
+    # If no specific agents, backup all detected
+    if [[ ${#agents[@]} -eq 0 ]]; then
+        for agent in "${!AGENT_FOLDERS[@]}"; do
+            agents+=("$agent")
+        done
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Agent Settings Backup${RESET}" >&2
+    printf '%s\n' "─────────────────────────" >&2
+    printf '\n' >&2
+
+    for agent in "${agents[@]}"; do
+        if ! agent_exists "$agent"; then
+            log_error "Unknown agent: ${agent}"
+            ((failed++))
+            continue
+        fi
+
+        if ! agent_source_exists "$agent"; then
+            log_debug "Skipping ${agent} (not installed)"
+            ((skipped++))
+            continue
+        fi
+
+        if backup_agent "$agent"; then
+            ((backed_up++))
+        else
+            ((failed++))
+        fi
+    done
+
+    printf '\n' >&2
+    printf '%s\n' "─────────────────────────" >&2
+    log_info "Summary: ${backed_up} backed up, ${skipped} skipped, ${failed} failed"
+
+    [[ $failed -eq 0 ]]
+}
+
+#==============================================================================
+# RESTORE OPERATIONS
+#==============================================================================
+
+restore_agent() {
+    local agent="$1"
+    local commit="${2:-HEAD}"
+    local source
+    local dest
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+
+    source=$(get_agent_backup_dir "$agent")
+    dest=$(get_agent_source "$agent")
+
+    if [[ ! -d "$source/.git" ]]; then
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    log_step "Restoring ${agent_name} from backup..."
+    log_debug "Backup: ${source}"
+    log_debug "Destination: ${dest}"
+    log_debug "Commit: ${commit}"
+
+    # Create destination if needed
+    mkdir -p "$dest"
+
+    # If restoring a specific commit, checkout that commit first
+    if [[ "$commit" != "HEAD" ]]; then
+        git -C "$source" checkout "$commit" -- . >/dev/null 2>&1 || {
+            log_error "Failed to checkout commit: ${commit}"
+            return 1
+        }
+    fi
+
+    # Sync files
+    if command_exists rsync; then
+        rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.gitignore' \
+            "$source/" "$dest/" 2>/dev/null
+    else
+        rm -rf "$dest"/* 2>/dev/null
+        cp -r "$source"/* "$dest/" 2>/dev/null || true
+        rm -rf "$dest/.git" "$dest/.gitignore" 2>/dev/null
+    fi
+
+    # Reset to HEAD if we checked out a specific commit
+    if [[ "$commit" != "HEAD" ]]; then
+        git -C "$source" checkout HEAD -- . >/dev/null 2>&1
+    fi
+
+    log_success "Restored ${agent_name} from backup"
+    return 0
+}
+
+#==============================================================================
+# LIST / STATUS
+#==============================================================================
+
+list_backups() {
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Agent Settings Backup Status${RESET}" >&2
+    printf '%s\n' "────────────────────────────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    local backup_root
+    backup_root=$(get_backup_root)
+
+    printf '%-15s %-20s %-10s %-20s\n' "Agent" "Name" "Status" "Last Backup" >&2
+    printf '%s\n' "────────────────────────────────────────────────────────────" >&2
+
+    for agent in "${!AGENT_FOLDERS[@]}"; do
+        local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+        local source
+        local dest
+        local status
+        local last_backup="-"
+
+        source=$(get_agent_source "$agent")
+        dest=$(get_agent_backup_dir "$agent")
+
+        if [[ ! -d "$source" ]]; then
+            status="${DIM}not installed${RESET}"
+        elif [[ ! -d "$dest/.git" ]]; then
+            status="${YELLOW}no backup${RESET}"
+        else
+            status="${GREEN}backed up${RESET}"
+            last_backup=$(git -C "$dest" log -1 --format="%ar" 2>/dev/null || echo "unknown")
+        fi
+
+        printf "%-15s %-20s %-10b %-20s\n" "$agent" "$agent_name" "$status" "$last_backup" >&2
+    done | sort >&2
+
+    printf '\n' >&2
+    printf "Backup location: %s\n" "$backup_root" >&2
+}
+
+#==============================================================================
+# HISTORY
+#==============================================================================
+
+show_history() {
+    local agent="$1"
+    local limit="${2:-20}"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        log_error "No backup history for ${agent_name}"
+        return 1
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Backup History: ${agent_name}${RESET}" >&2
+    printf '%s\n' "─────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    git -C "$dest" log --oneline --decorate -n "$limit" 2>/dev/null
+
+    printf '\n' >&2
+    local total
+    total=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo "0")
+    log_info "Total backups: ${total}"
+}
+
+#==============================================================================
+# DIFF
+#==============================================================================
+
+show_diff() {
+    local agent="$1"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local source
+    local dest
+
+    source=$(get_agent_source "$agent")
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$source" ]]; then
+        log_error "${agent_name} not installed"
+        return 1
+    fi
+
+    if [[ ! -d "$dest/.git" ]]; then
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Changes since last backup: ${agent_name}${RESET}" >&2
+    printf '%s\n' "─────────────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    # Create a temp copy of current state
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" EXIT
+
+    # Copy current source to temp
+    cp -r "$source"/* "$temp_dir/" 2>/dev/null || true
+
+    # Compare with backup
+    diff -rq "$dest" "$temp_dir" \
+        --exclude='.git' \
+        --exclude='.gitignore' \
+        --exclude='*.log' \
+        --exclude='cache' \
+        --exclude='Cache' \
+        --exclude='.cache' \
+        2>/dev/null || true
+
+    printf '\n' >&2
+}
+
+#==============================================================================
+# INIT
+#==============================================================================
+
+init_backup_location() {
+    local backup_root
+    backup_root=$(get_backup_root)
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Initializing Backup Location${RESET}" >&2
+    printf '%s\n' "─────────────────────────────" >&2
+    printf '\n' >&2
+
+    if [[ -d "$backup_root" ]]; then
+        log_info "Backup location already exists: ${backup_root}"
+    else
+        log_step "Creating backup location: ${backup_root}"
+        mkdir -p "$backup_root"
+        log_success "Created backup location"
+    fi
+
+    # Create a README in the backup root
+    cat > "$backup_root/README.md" << 'EOF'
+# Agent Settings Backups
+
+This directory contains git-versioned backups of AI coding agent configuration folders.
+
+## Structure
+
+Each agent has its own directory with a full git repository:
+
+```
+.agent_settings_backups/
+├── .claude/          # Claude Code
+├── .codex/           # OpenAI Codex CLI
+├── .cursor/          # Cursor
+├── .gemini/          # Google Gemini
+├── .cline/           # Cline
+├── .amp/             # Amp (Sourcegraph)
+├── .aider/           # Aider
+├── .opencode/        # OpenCode
+├── .factory/         # Factory Droid
+└── .windsurf/        # Windsurf
+```
+
+## Usage
+
+```bash
+# Backup all agents
+asb backup
+
+# Backup specific agent
+asb backup claude
+
+# Show history
+asb history claude
+
+# Restore from backup
+asb restore claude
+
+# Restore from specific commit
+asb restore claude abc1234
+```
+
+## Generated by
+
+Agent Settings Backup (asb)
+https://github.com/Dicklesworthstone/agent_settings_backup_script
+EOF
+
+    log_success "Initialization complete"
+    printf '\n' >&2
+    log_info "Run 'asb backup' to create your first backup"
+}
+
+#==============================================================================
+# HELP
+#==============================================================================
+
+show_help() {
+    cat << EOF
+
+${BOLD}asb${RESET} - Agent Settings Backup v${ASB_VERSION}
+
+${BOLD}USAGE${RESET}
+    asb <command> [options]
+
+${BOLD}COMMANDS${RESET}
+    backup [agents...]    Backup agent settings (all if none specified)
+    restore <agent> [commit]  Restore agent from backup
+    list                  List all agents and backup status
+    history <agent>       Show backup history for an agent
+    diff <agent>          Show changes since last backup
+    init                  Initialize backup location
+    help                  Show this help message
+    version               Show version
+
+${BOLD}SUPPORTED AGENTS${RESET}
+    claude      Claude Code (~/.claude)
+    codex       OpenAI Codex CLI (~/.codex)
+    cursor      Cursor (~/.cursor)
+    gemini      Google Gemini (~/.gemini)
+    cline       Cline (~/.cline)
+    amp         Amp/Sourcegraph (~/.amp)
+    aider       Aider (~/.aider)
+    opencode    OpenCode (~/.opencode)
+    factory     Factory Droid (~/.factory)
+    windsurf    Windsurf (~/.windsurf)
+
+${BOLD}ENVIRONMENT${RESET}
+    ASB_BACKUP_ROOT       Backup location (default: ~/.agent_settings_backups)
+    ASB_AUTO_COMMIT       Auto-commit on backup (default: true)
+    ASB_VERBOSE           Verbose output (default: false)
+
+${BOLD}EXAMPLES${RESET}
+    asb backup                  # Backup all detected agents
+    asb backup claude codex     # Backup specific agents
+    asb list                    # Show backup status
+    asb history claude          # Show Claude backup history
+    asb restore claude          # Restore Claude from latest backup
+    asb restore claude abc123   # Restore from specific commit
+
+EOF
+}
+
+show_version() {
+    echo "asb version ${ASB_VERSION}"
+}
+
+#==============================================================================
+# MAIN
+#==============================================================================
+
+main() {
+    # Check for git
+    if ! command_exists git; then
+        log_error "git is required but not installed"
+        exit 1
+    fi
+
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        backup|b)
+            backup_all "$@"
+            ;;
+        restore|r)
+            if [[ $# -lt 1 ]]; then
+                log_error "Usage: asb restore <agent> [commit]"
+                exit 1
+            fi
+            restore_agent "$@"
+            ;;
+        list|ls|l)
+            list_backups
+            ;;
+        history|h|log)
+            if [[ $# -lt 1 ]]; then
+                log_error "Usage: asb history <agent>"
+                exit 1
+            fi
+            show_history "$@"
+            ;;
+        diff|d)
+            if [[ $# -lt 1 ]]; then
+                log_error "Usage: asb diff <agent>"
+                exit 1
+            fi
+            show_diff "$@"
+            ;;
+        init|i)
+            init_backup_location
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        version|--version|-v)
+            show_version
+            ;;
+        *)
+            log_error "Unknown command: ${command}"
+            log_info "Run 'asb help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,14 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Shell scripts
+*.sh text eol=lf
+asb text eol=lf
+
+# Markdown
+*.md text
+
+# Ensure these stay as-is
+*.png binary
+*.jpg binary
+*.gif binary

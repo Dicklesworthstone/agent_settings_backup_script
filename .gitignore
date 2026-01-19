@@ -1,0 +1,20 @@
+# Logs
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Test artifacts
+test_output/
+coverage/
+
+# Build artifacts
+a.out
