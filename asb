@@ -251,6 +251,7 @@ backup_agent() {
     if command_exists rsync; then
         rsync -a --delete \
             --exclude='.git' \
+            --exclude='.gitignore' \
             --exclude='*.log' \
             --exclude='cache/' \
             --exclude='Cache/' \
