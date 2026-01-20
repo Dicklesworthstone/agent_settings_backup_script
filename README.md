@@ -13,10 +13,12 @@ A smart backup tool for AI coding agent configuration folders. Each agent type g
 ## Installation
 
 ```bash
-# Quick install
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/agent_settings_backup_script/main/install.sh" | bash
+```
 
-# Or clone and install manually
+Or clone and install manually:
+
+```bash
 git clone https://github.com/Dicklesworthstone/agent_settings_backup_script.git
 cd agent_settings_backup_script
 cp asb ~/.local/bin/
