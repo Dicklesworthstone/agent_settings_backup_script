@@ -60,6 +60,7 @@ DRY_RUN=false
 
 # JSON output mode - output machine-readable JSON (set via --json or -j flag)
 JSON_OUTPUT="${JSON_OUTPUT:-false}"
+JSON_ERROR_EMITTED=false
 
 # Internal flag for restore preview changes
 RESTORE_HAS_CHANGES=false
@@ -708,10 +709,12 @@ confirm_restore() {
 
 restore_agent() {
     local agent="$1"
-    local commit="${2:-HEAD}"
+    local commit_ref="${2:-HEAD}"
     local source
     local dest
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local commit
+    local is_tag=false
 
     source=$(get_agent_backup_dir "$agent")
     dest=$(get_agent_source "$agent")
@@ -721,10 +724,17 @@ restore_agent() {
         return 1
     fi
 
-    # Validate commit exists
-    if ! git -C "$source" rev-parse --verify "$commit" >/dev/null 2>&1; then
-        log_error "Invalid commit: ${commit}"
+    # Resolve tag names to commits
+    if git -C "$source" rev-parse --verify "refs/tags/${commit_ref}" >/dev/null 2>&1; then
+        commit=$(git -C "$source" rev-parse "refs/tags/${commit_ref}")
+        is_tag=true
+        log_info "Restoring from tag '${commit_ref}'"
+    elif git -C "$source" rev-parse --verify "$commit_ref" >/dev/null 2>&1; then
+        commit=$(git -C "$source" rev-parse "$commit_ref")
+    else
+        log_error "Invalid commit or tag: ${commit_ref}"
         log_info "Run 'asb history ${agent}' to see valid commits"
+        log_info "Run 'asb tag ${agent} --list' to see available tags"
         return 1
     fi
 
@@ -1102,12 +1112,23 @@ show_history() {
         total=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo "0")
 
         # Get commit data in a machine-parseable format
-        while IFS=$'\t' read -r commit date message; do
+        while IFS=$'\t' read -r full_commit commit date message; do
             # Escape message for JSON
             message=$(json_escape_string "$message")
-            local json_item="{\"commit\":\"${commit}\",\"date\":\"${date}\",\"message\":\"${message}\"}"
+            local tags_raw
+            tags_raw=$(git -C "$dest" tag --points-at "$full_commit" 2>/dev/null || true)
+            local tag_items=()
+            if [[ -n "$tags_raw" ]]; then
+                while IFS= read -r tag; do
+                    [[ -n "$tag" ]] || continue
+                    tag_items+=("\"$(json_escape_string "$tag")\"")
+                done <<< "$tags_raw"
+            fi
+            local tags_json
+            tags_json=$(json_array "${tag_items[@]}")
+            local json_item="{\"commit\":\"${commit}\",\"date\":\"${date}\",\"message\":\"${message}\",\"tags\":${tags_json}}"
             json_items+=("$json_item")
-        done < <(git -C "$dest" log --format="%h%x09%aI%x09%s" -n "$limit" 2>/dev/null)
+        done < <(git -C "$dest" log --format="%H%x09%h%x09%aI%x09%s" -n "$limit" 2>/dev/null)
 
         # Build the final JSON
         local commits_json="["
@@ -1397,6 +1418,51 @@ schedule_status_systemd() {
     fi
 }
 
+schedule_status_json() {
+    local mode="${1:-}"
+    local cron_json="null"
+    local systemd_json="null"
+
+    if [[ -z "$mode" || "$mode" == "cron" ]]; then
+        local cron_available=false
+        local cron_installed=false
+        local cron_line=""
+
+        if command_exists crontab; then
+            cron_available=true
+            local existing
+            existing=$(crontab -l 2>/dev/null || true)
+            if printf '%s\n' "$existing" | grep -q 'ASB_BACKUP_SCHEDULE'; then
+                cron_installed=true
+                cron_line=$(printf '%s\n' "$existing" | grep 'ASB_BACKUP_SCHEDULE' | tail -n 1)
+            fi
+        fi
+
+        local cron_line_json="null"
+        if [[ -n "$cron_line" ]]; then
+            cron_line_json="\"$(json_escape_string "$cron_line")\""
+        fi
+
+        cron_json="{\"available\":${cron_available},\"installed\":${cron_installed},\"line\":${cron_line_json}}"
+    fi
+
+    if [[ -z "$mode" || "$mode" == "systemd" ]]; then
+        local systemd_available=false
+        local systemd_enabled=false
+
+        if command_exists systemctl; then
+            systemd_available=true
+            if systemctl --user is-enabled asb-backup.timer >/dev/null 2>&1; then
+                systemd_enabled=true
+            fi
+        fi
+
+        systemd_json="{\"available\":${systemd_available},\"enabled\":${systemd_enabled}}"
+    fi
+
+    json_output "{\"cron\":${cron_json},\"systemd\":${systemd_json}}"
+}
+
 show_schedule_help() {
     cat << EOF
 
@@ -1468,6 +1534,10 @@ schedule_backup() {
     fi
 
     if [[ "$status" == "true" ]]; then
+        if is_json_output; then
+            schedule_status_json "$mode"
+            return $?
+        fi
         if [[ -n "$mode" ]]; then
             if [[ "$mode" == "cron" ]]; then
                 schedule_status_cron
@@ -1518,6 +1588,120 @@ schedule_backup() {
 #==============================================================================
 # VERIFY
 #==============================================================================
+
+verify_agent_json() {
+    local agent="$1"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+    local issues=0
+    local warnings=0
+    local details=()
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    # Check if backup directory exists
+    if [[ ! -d "$dest" ]]; then
+        details+=("\"$(json_escape_string "No backup directory found")\"")
+        issues=1
+        json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"missing\",\"issues\":${issues},\"warnings\":${warnings},\"details\":$(json_array "${details[@]}")}"
+        return 1
+    fi
+
+    # Check if it's a git repository
+    if [[ ! -d "$dest/.git" ]]; then
+        details+=("\"$(json_escape_string "Not a git repository")\"")
+        ((issues++))
+    else
+        # Run git fsck to check repository integrity
+        local fsck_output
+        if ! fsck_output=$(git -C "$dest" fsck --no-dangling 2>&1); then
+            details+=("\"$(json_escape_string "Git repository integrity check failed")\"")
+            if [[ -n "$fsck_output" ]]; then
+                details+=("\"$(json_escape_string "$fsck_output")\"")
+            fi
+            ((issues++))
+        fi
+
+        # Check if HEAD is valid
+        if ! git -C "$dest" rev-parse HEAD &>/dev/null; then
+            details+=("\"$(json_escape_string "Invalid HEAD reference")\"")
+            ((issues++))
+        fi
+
+        # Check if there's at least one commit
+        local commit_count
+        commit_count=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo "0")
+        if [[ "$commit_count" -eq 0 ]]; then
+            details+=("\"$(json_escape_string "No commits in repository")\"")
+            ((warnings++))
+        fi
+    fi
+
+    # Check if .gitignore exists
+    if [[ ! -f "$dest/.gitignore" ]]; then
+        details+=("\"$(json_escape_string "Missing .gitignore file")\"")
+        ((warnings++))
+    fi
+
+    local status="ok"
+    if [[ "$issues" -gt 0 ]]; then
+        status="error"
+    elif [[ "$warnings" -gt 0 ]]; then
+        status="warning"
+    fi
+
+    json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"${status}\",\"issues\":${issues},\"warnings\":${warnings},\"details\":$(json_array "${details[@]}")}"
+
+    if [[ "$issues" -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+verify_all_json() {
+    local agents=("$@")
+    local results=()
+    local failed=0
+
+    # If no agents specified, verify all backed-up agents
+    if [[ ${#agents[@]} -eq 0 ]]; then
+        for agent in "${!AGENT_FOLDERS[@]}"; do
+            local dest
+            dest=$(get_agent_backup_dir "$agent")
+            if [[ -d "$dest" ]]; then
+                agents+=("$agent")
+            fi
+        done
+    fi
+
+    if [[ ${#agents[@]} -eq 0 ]]; then
+        json_output "[]"
+        return 0
+    fi
+
+    # Sort agents for consistent output
+    IFS=$'\n' agents=($(sort <<<"${agents[*]}")); unset IFS
+
+    for agent in "${agents[@]}"; do
+        if ! agent_exists "$agent"; then
+            local agent_msg="Unknown agent: ${agent}"
+            results+=("{\"agent\":\"$(json_escape_string "$agent")\",\"name\":\"$(json_escape_string "$agent")\",\"status\":\"unknown\",\"issues\":1,\"warnings\":0,\"details\":$(json_array "\"$(json_escape_string "$agent_msg")\"")}")
+            failed=1
+            continue
+        fi
+
+        local item
+        if item=$(verify_agent_json "$agent"); then
+            :
+        else
+            failed=1
+        fi
+        results+=("$item")
+    done
+
+    json_output "$(json_array "${results[@]}")"
+    return $failed
+}
 
 verify_agent() {
     local agent="$1"
@@ -1609,6 +1793,11 @@ verify_all() {
     local failed=0
     local skipped=0
 
+    if is_json_output; then
+        verify_all_json "$@"
+        return $?
+    fi
+
     printf '\n' >&2
     printf '%b\n' "${BOLD}Verifying Backup Integrity${RESET}" >&2
     printf '%s\n' "────────────────────────────────────────────────────────────" >&2
@@ -1664,6 +1853,293 @@ verify_all() {
     fi
 
     [[ "$failed" -eq 0 ]]
+}
+
+#==============================================================================
+# TAGS
+#==============================================================================
+
+# Validate tag name - only alphanumeric, underscore, hyphen allowed
+validate_tag_name() {
+    local tagname="$1"
+    if [[ ! "$tagname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Create a tag for a backup commit
+tag_backup() {
+    local agent="$1"
+    local tagname="$2"
+    local commit="${3:-HEAD}"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        if is_json_output; then
+            json_error "No backup found for ${agent}"
+        fi
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    if ! validate_tag_name "$tagname"; then
+        if is_json_output; then
+            json_error "Invalid tag name. Use only letters, numbers, underscore, hyphen"
+        fi
+        log_error "Invalid tag name: ${tagname}"
+        log_info "Tag names can only contain letters, numbers, underscore, and hyphen"
+        return 1
+    fi
+
+    # Check if tag already exists
+    if git -C "$dest" tag -l "$tagname" | grep -q "^${tagname}$"; then
+        if is_json_output; then
+            json_error "Tag '${tagname}' already exists for ${agent}"
+        fi
+        log_error "Tag '${tagname}' already exists for ${agent_name}"
+        log_info "Use 'asb tag ${agent} --delete ${tagname}' to remove it first"
+        return 1
+    fi
+
+    # Resolve commit reference
+    if ! git -C "$dest" rev-parse --verify "$commit" &>/dev/null; then
+        if is_json_output; then
+            json_error "Invalid commit reference: ${commit}"
+        fi
+        log_error "Invalid commit reference: ${commit}"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if is_json_output; then
+            local resolved_commit
+            resolved_commit=$(git -C "$dest" rev-parse --short "$commit")
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"tag\":\"$(json_escape_string "$tagname")\",\"commit\":\"${resolved_commit}\",\"dry_run\":true}"
+        else
+            log_info "[DRY RUN] Would tag ${agent_name} backup as '${tagname}' at commit ${commit}"
+        fi
+        return 0
+    fi
+
+    if git -C "$dest" tag "$tagname" "$commit" 2>/dev/null; then
+        local resolved_commit
+        resolved_commit=$(git -C "$dest" rev-parse --short "$commit")
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"tag\":\"$(json_escape_string "$tagname")\",\"commit\":\"${resolved_commit}\",\"success\":true}"
+        else
+            log_success "Tagged ${agent_name} backup as '${tagname}' (${resolved_commit})"
+        fi
+        return 0
+    else
+        if is_json_output; then
+            json_error "Failed to create tag '${tagname}'"
+        fi
+        log_error "Failed to create tag '${tagname}'"
+        return 1
+    fi
+}
+
+# List all tags for an agent
+list_tags() {
+    local agent="$1"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        if is_json_output; then
+            json_error "No backup found for ${agent}"
+        fi
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    local tags
+    tags=$(git -C "$dest" tag -l 2>/dev/null | sort)
+
+    if is_json_output; then
+        local tag_array=()
+        while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            local commit
+            commit=$(git -C "$dest" rev-parse --short "$tag" 2>/dev/null || echo "unknown")
+            local date
+            date=$(git -C "$dest" log -1 --format="%ci" "$tag" 2>/dev/null || echo "unknown")
+            tag_array+=("{\"tag\":\"$(json_escape_string "$tag")\",\"commit\":\"${commit}\",\"date\":\"$(json_escape_string "$date")\"}")
+        done <<< "$tags"
+        json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"tags\":$(json_array "${tag_array[@]}")}"
+        return 0
+    fi
+
+    if [[ -z "$tags" ]]; then
+        log_info "No tags found for ${agent_name}"
+        return 0
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Tags for ${agent_name}${RESET}" >&2
+    printf '%s\n' "────────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    while IFS= read -r tag; do
+        [[ -z "$tag" ]] && continue
+        local commit
+        commit=$(git -C "$dest" rev-parse --short "$tag" 2>/dev/null || echo "???")
+        local date
+        date=$(git -C "$dest" log -1 --format="%cr" "$tag" 2>/dev/null || echo "unknown")
+        printf '  %b%-20s%b  %s  (%s)\n' "${CYAN}" "$tag" "${RESET}" "$commit" "$date" >&2
+    done <<< "$tags"
+    printf '\n' >&2
+}
+
+# Delete a tag
+delete_tag() {
+    local agent="$1"
+    local tagname="$2"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        if is_json_output; then
+            json_error "No backup found for ${agent}"
+        fi
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    # Check if tag exists
+    if ! git -C "$dest" tag -l "$tagname" | grep -q "^${tagname}$"; then
+        if is_json_output; then
+            json_error "Tag '${tagname}' not found for ${agent}"
+        fi
+        log_error "Tag '${tagname}' not found for ${agent_name}"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"tag\":\"$(json_escape_string "$tagname")\",\"deleted\":false,\"dry_run\":true}"
+        else
+            log_info "[DRY RUN] Would delete tag '${tagname}' from ${agent_name}"
+        fi
+        return 0
+    fi
+
+    if [[ "$FORCE" != "true" ]]; then
+        printf '%b' "${YELLOW}Delete tag '${tagname}' from ${agent_name}? [y/N] ${RESET}" >&2
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            log_info "Cancelled"
+            return 0
+        fi
+    fi
+
+    if git -C "$dest" tag -d "$tagname" &>/dev/null; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"tag\":\"$(json_escape_string "$tagname")\",\"deleted\":true}"
+        else
+            log_success "Deleted tag '${tagname}' from ${agent_name}"
+        fi
+        return 0
+    else
+        if is_json_output; then
+            json_error "Failed to delete tag '${tagname}'"
+        fi
+        log_error "Failed to delete tag '${tagname}'"
+        return 1
+    fi
+}
+
+# Resolve a tag name to a commit hash (for restore)
+resolve_tag_or_commit() {
+    local agent="$1"
+    local ref="$2"
+    local dest
+
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Try to resolve as a tag first, then as a commit
+    if git -C "$dest" rev-parse --verify "refs/tags/${ref}" &>/dev/null; then
+        git -C "$dest" rev-parse "refs/tags/${ref}"
+    elif git -C "$dest" rev-parse --verify "$ref" &>/dev/null; then
+        git -C "$dest" rev-parse "$ref"
+    else
+        echo ""
+        return 1
+    fi
+}
+
+# Main tag command handler
+tag_command() {
+    if [[ $# -lt 1 ]]; then
+        if is_json_output; then
+            json_error "Usage: asb tag <agent> <tagname> [commit] | asb tag <agent> --list | asb tag <agent> --delete <tagname>"
+        fi
+        log_error "Usage: asb tag <agent> <tagname> [commit]"
+        log_info "       asb tag <agent> --list"
+        log_info "       asb tag <agent> --delete <tagname>"
+        return 1
+    fi
+
+    local agent="$1"
+    shift
+
+    if ! agent_exists "$agent"; then
+        if is_json_output; then
+            json_error "Unknown agent: ${agent}"
+        fi
+        log_error "Unknown agent: ${agent}"
+        log_info "Run 'asb list' to see available agents"
+        return 1
+    fi
+
+    # Parse subcommand
+    case "${1:-}" in
+        --list|-l)
+            list_tags "$agent"
+            ;;
+        --delete|-d)
+            if [[ -z "${2:-}" ]]; then
+                if is_json_output; then
+                    json_error "Usage: asb tag <agent> --delete <tagname>"
+                fi
+                log_error "Usage: asb tag <agent> --delete <tagname>"
+                return 1
+            fi
+            delete_tag "$agent" "$2"
+            ;;
+        "")
+            if is_json_output; then
+                json_error "Usage: asb tag <agent> <tagname> [commit]"
+            fi
+            log_error "Missing tag name"
+            log_info "Usage: asb tag <agent> <tagname> [commit]"
+            return 1
+            ;;
+        -*)
+            if is_json_output; then
+                json_error "Unknown option: ${1}"
+            fi
+            log_error "Unknown option: ${1}"
+            return 1
+            ;;
+        *)
+            # Create tag
+            tag_backup "$agent" "$@"
+            ;;
+    esac
 }
 
 #==============================================================================
@@ -2173,7 +2649,7 @@ ${BOLD}OPTIONS${RESET}
     -n, --dry-run         Show what would happen without making changes
     -f, --force           Skip confirmation prompts (use with caution)
     -v, --verbose         Show detailed output
-    -j, --json            Output in machine-readable JSON format
+    -j, --json            Output machine-readable JSON (where supported)
 
 ${BOLD}COMMANDS${RESET}
     backup [agents...]        Backup agent settings (all if none specified)
@@ -2184,6 +2660,7 @@ ${BOLD}COMMANDS${RESET}
     history <agent>           Show backup history for an agent
     diff <agent>              Show changes since last backup
     verify [agents...]        Verify backup integrity (all if none specified)
+    tag <agent> <name>        Tag a backup commit with a meaningful name
     schedule [options]        Set up automated scheduled backups
     init                      Initialize backup location
     config [init|show]        Manage configuration
@@ -2265,6 +2742,13 @@ ${BOLD}EXAMPLES${RESET}
 
     # Transfer to remote machine
     asb export claude - | ssh server "asb import -"
+
+    # Tag backups with meaningful names
+    asb tag claude pre-upgrade          # Tag current backup
+    asb tag claude stable abc123        # Tag specific commit
+    asb tag claude --list               # List all tags
+    asb tag claude --delete pre-upgrade # Delete a tag
+    asb restore claude pre-upgrade      # Restore using tag name
 
 ${BOLD}SHELL COMPLETION${RESET}
     Enable tab completion for commands and agent names:
@@ -2403,6 +2887,9 @@ main() {
             ;;
         verify|v)
             verify_all "$@"
+            ;;
+        tag|t)
+            tag_command "$@"
             ;;
         schedule|sched)
             schedule_backup "$@"
