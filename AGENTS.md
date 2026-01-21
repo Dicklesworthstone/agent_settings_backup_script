@@ -73,6 +73,8 @@ Each agent gets its own git repository in the backup location:
 | `show_completion_bash` | Outputs bash completion script |
 | `show_completion_zsh` | Outputs zsh completion script |
 | `show_completion_fish` | Outputs fish completion script |
+| `run_hooks` | Executes pre/post backup or restore hooks |
+| `list_hooks` | Lists configured hooks |
 | `init_git_repo` | Initializes git repo with .gitignore for an agent |
 | `create_backup_commit` | Stages changes and creates commit with timestamp |
 | `show_history` | Displays git log for an agent's backup |

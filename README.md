@@ -15,6 +15,7 @@ A smart backup tool for AI coding agent configuration folders. Each agent type g
 - **Shell completion**: Bash, Zsh, and Fish completions
 - **Dry-run mode**: Preview operations without changes
 - **Scheduled backups**: Install cron or systemd timers with `asb schedule`
+- **Hooks**: Run scripts before/after backup and restore
 
 ## New in v0.2
 
@@ -86,6 +87,7 @@ Commands:
   diff <agent>              Show changes since last backup
   verify [agents...]        Verify backup integrity (all if none specified)
   schedule [options]        Set up automated scheduled backups
+  hooks --list              List configured hooks
   init                      Initialize backup location
   config [init|show]        Manage configuration
   completion [bash|zsh|fish] Output shell completion script
@@ -199,6 +201,42 @@ Environment variables:
 | `ASB_BACKUP_ROOT` | `~/.agent_settings_backups` | Backup location |
 | `ASB_AUTO_COMMIT` | `true` | Auto-commit on backup |
 | `ASB_VERBOSE` | `false` | Verbose output |
+
+## Hooks
+
+asb can run user-defined scripts before and after backup/restore operations.
+
+Hook directories (created by `asb config init`):
+
+```
+~/.config/asb/hooks/
+  pre-backup.d/    # Run before any backup
+  post-backup.d/   # Run after successful backup
+  pre-restore.d/   # Run before any restore
+  post-restore.d/  # Run after successful restore
+```
+
+Rules:
+- Hooks run in alphabetical order (e.g., `01-*.sh`, `02-*.sh`)
+- Scripts must be executable
+- Pre-hook failure aborts the operation
+- Post-hook failure logs a warning but continues
+
+Environment variables passed to hooks:
+
+| Variable | Description |
+|----------|-------------|
+| `ASB_AGENT` | Agent name (e.g., `claude`) |
+| `ASB_SOURCE` | Source config path (e.g., `~/.claude`) |
+| `ASB_BACKUP_DIR` | Backup directory path |
+| `ASB_OPERATION` | `backup` or `restore` |
+| `ASB_COMMIT` | Commit hash (post-backup) or restore target |
+
+List active hooks:
+
+```bash
+asb hooks --list
+```
 
 ## Backup Structure
 

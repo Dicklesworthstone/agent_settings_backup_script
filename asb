@@ -62,6 +62,9 @@ DRY_RUN=false
 JSON_OUTPUT="${JSON_OUTPUT:-false}"
 JSON_ERROR_EMITTED=false
 
+# Last backup commit hash (set during backup for hooks)
+LAST_BACKUP_COMMIT=""
+
 # Internal flag for restore preview changes
 RESTORE_HAS_CHANGES=false
 
@@ -174,6 +177,10 @@ get_config_file() {
     echo "$(get_config_dir)/config"
 }
 
+get_hooks_root() {
+    echo "$(get_config_dir)/hooks"
+}
+
 get_asb_command_path() {
     local cmd_path=""
     if cmd_path=$(command -v asb 2>/dev/null); then
@@ -264,6 +271,68 @@ json_array() {
 }
 
 #==============================================================================
+# HOOKS
+#==============================================================================
+
+run_hooks() {
+    local hook_type="$1"
+    local agent="$2"
+    local commit="${3:-}"
+    local hooks_root
+    hooks_root=$(get_hooks_root)
+    local hook_dir="${hooks_root}/${hook_type}.d"
+
+    if is_dry_run; then
+        log_debug "Skipping hooks in dry-run: ${hook_type}"
+        return 0
+    fi
+
+    if [[ ! -d "$hook_dir" ]]; then
+        log_debug "No hook directory: ${hook_dir}"
+        return 0
+    fi
+
+    local scripts=()
+    local script
+    for script in "$hook_dir"/*; do
+        [[ -f "$script" ]] || continue
+        scripts+=("$script")
+    done
+
+    if [[ ${#scripts[@]} -eq 0 ]]; then
+        log_debug "No hooks found in ${hook_dir}"
+        return 0
+    fi
+
+    IFS=$'\n' scripts=($(printf '%s\n' "${scripts[@]}" | sort)); unset IFS
+
+    export ASB_AGENT="$agent"
+    export ASB_SOURCE
+    ASB_SOURCE=$(get_agent_source "$agent")
+    export ASB_BACKUP_DIR
+    ASB_BACKUP_DIR=$(get_agent_backup_dir "$agent")
+    export ASB_OPERATION="${hook_type%%-*}"
+    export ASB_COMMIT="${commit:-}"
+
+    for script in "${scripts[@]}"; do
+        if [[ ! -x "$script" ]]; then
+            log_debug "Skipping non-executable hook: ${script}"
+            continue
+        fi
+        log_debug "Running hook: ${script}"
+        if ! "$script"; then
+            if [[ "$hook_type" == pre-* ]]; then
+                log_error "Pre-hook failed: ${script}"
+                return 1
+            fi
+            log_warn "Post-hook failed: ${script}"
+        fi
+    done
+
+    return 0
+}
+
+#==============================================================================
 # CONFIGURATION
 #==============================================================================
 
@@ -344,6 +413,7 @@ create_backup_commit() {
         # Check for untracked files
         if [[ -z "$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
             log_info "No changes detected for ${agent_name}"
+            LAST_BACKUP_COMMIT=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "")
             return 0
         fi
     fi
@@ -367,6 +437,7 @@ create_backup_commit() {
     # Show brief summary
     local commit_hash
     commit_hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+    LAST_BACKUP_COMMIT="$commit_hash"
     log_debug "Commit: ${commit_hash}"
 }
 
@@ -431,6 +502,10 @@ backup_agent() {
         return 0
     fi
 
+    if ! run_hooks "pre-backup" "$agent"; then
+        return 1
+    fi
+
     log_step "Backing up ${agent_name}..."
     log_debug "Source: ${source}"
     log_debug "Destination: ${dest}"
@@ -473,9 +548,15 @@ backup_agent() {
     fi
 
     # Create commit if auto-commit is enabled
+    local hook_commit=""
     if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
         create_backup_commit "$dest" "$agent"
+        hook_commit="$LAST_BACKUP_COMMIT"
+    else
+        hook_commit=$(git -C "$dest" rev-parse --short HEAD 2>/dev/null || echo "")
     fi
+
+    run_hooks "post-backup" "$agent" "$hook_commit" || true
 
     return 0
 }
@@ -760,6 +841,10 @@ restore_agent() {
         return 1
     fi
 
+    if ! run_hooks "pre-restore" "$agent" "$commit"; then
+        return 1
+    fi
+
     # === PROCEED WITH RESTORE ===
     log_step "Restoring ${agent_name} from backup..."
     log_debug "Backup: ${source}"
@@ -807,6 +892,7 @@ restore_agent() {
     fi
 
     log_success "Restored ${agent_name} from backup"
+    run_hooks "post-restore" "$agent" "$commit" || true
     return 0
 }
 
@@ -1586,6 +1672,103 @@ schedule_backup() {
 }
 
 #==============================================================================
+# HOOKS COMMANDS
+#==============================================================================
+
+list_hooks() {
+    local hooks_root
+    hooks_root=$(get_hooks_root)
+    local hook_types=(pre-backup post-backup pre-restore post-restore)
+
+    if is_json_output; then
+        local entries=()
+        local hook_type
+        for hook_type in "${hook_types[@]}"; do
+            local dir="${hooks_root}/${hook_type}.d"
+            local names=()
+            if [[ -d "$dir" ]]; then
+                local script
+                for script in "$dir"/*; do
+                    [[ -x "$script" ]] || continue
+                    names+=("\"$(json_escape_string "$(basename "$script")")\"")
+                done
+            fi
+            entries+=("\"${hook_type}\":$(json_array "${names[@]}")")
+        done
+
+        local hooks_json="{"
+        local first=true
+        local entry
+        for entry in "${entries[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                hooks_json+=","
+            fi
+            hooks_json+="$entry"
+        done
+        hooks_json+="}"
+
+        json_output "{\"root\":\"$(json_escape_string "$hooks_root")\",\"hooks\":${hooks_json}}"
+        return 0
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}asb Hooks${RESET}" >&2
+    printf '%s\n' "─────────────────────────────" >&2
+    printf '\n' >&2
+    printf "Hooks root: %s\n\n" "$hooks_root" >&2
+
+    local hook_type
+    for hook_type in "${hook_types[@]}"; do
+        local dir="${hooks_root}/${hook_type}.d"
+        printf "%-15s " "${hook_type}:" >&2
+        if [[ ! -d "$dir" ]]; then
+            printf "%b\n" "${DIM}(missing directory)${RESET}" >&2
+            continue
+        fi
+
+        local scripts=()
+        local script
+        for script in "$dir"/*; do
+            [[ -x "$script" ]] || continue
+            scripts+=("$(basename "$script")")
+        done
+
+        if [[ ${#scripts[@]} -eq 0 ]]; then
+            printf "%b\n" "${DIM}(none)${RESET}" >&2
+            continue
+        fi
+
+        printf "%s\n" "${scripts[*]}" >&2
+    done
+}
+
+hooks_command() {
+    local action="${1:-list}"
+    case "$action" in
+        list|--list|-l)
+            list_hooks
+            ;;
+        -h|--help|help)
+            printf '\n' >&2
+            printf '%b\n' "${BOLD}asb hooks${RESET} - list configured hooks" >&2
+            printf '%s\n' "────────────────────────────────────" >&2
+            printf '\n' >&2
+            printf "Usage:\n" >&2
+            printf "  asb hooks --list\n" >&2
+            printf "  asb hooks list\n" >&2
+            printf '\n' >&2
+            ;;
+        *)
+            log_error "Unknown hooks command: ${action}"
+            log_info "Usage: asb hooks --list"
+            return 1
+            ;;
+    esac
+}
+
+#==============================================================================
 # VERIFY
 #==============================================================================
 
@@ -2235,12 +2418,28 @@ init_config() {
     local config_file
     config_dir=$(get_config_dir)
     config_file=$(get_config_file)
+    local hooks_root
+    hooks_root=$(get_hooks_root)
 
     # Create directory if needed
     if [[ ! -d "$config_dir" ]]; then
         log_step "Creating config directory: $config_dir"
         mkdir -p "$config_dir"
     fi
+
+    # Ensure hooks directory structure exists
+    local hook_dirs=(
+        "${hooks_root}/pre-backup.d"
+        "${hooks_root}/post-backup.d"
+        "${hooks_root}/pre-restore.d"
+        "${hooks_root}/post-restore.d"
+    )
+    local hook_dir
+    for hook_dir in "${hook_dirs[@]}"; do
+        if [[ ! -d "$hook_dir" ]]; then
+            mkdir -p "$hook_dir"
+        fi
+    done
 
     # Don't overwrite existing config
     if [[ -f "$config_file" ]]; then
@@ -2359,13 +2558,16 @@ _asb_completions() {
     done
 
     # All commands
-    local commands="backup restore export import list history diff verify schedule init config help version completion"
+    local commands="backup restore export import list history diff verify tag schedule hooks init config help version completion"
 
     # All agent names (keep in sync with AGENT_FOLDERS)
     local agents="aider amazonq amp claude cline codex cursor factory gemini opencode plandex qwencode windsurf"
 
     # Config subcommands
     local config_cmds="init show"
+
+    # Tag subcommands
+    local tag_opts="--list -l --delete -d"
 
     # Schedule options
     local schedule_opts="--cron --systemd --interval --status --remove --help"
@@ -2384,7 +2586,7 @@ _asb_completions() {
         backup|b|verify|v)
             COMPREPLY=($(compgen -W "$agents" -- "$cur"))
             ;;
-        restore|r|history|h|log|diff|d|export|ex)
+        restore|r|history|h|log|diff|d|export|ex|tag|t)
             COMPREPLY=($(compgen -W "$agents" -- "$cur"))
             ;;
         config|cfg)
@@ -2392,6 +2594,9 @@ _asb_completions() {
             ;;
         schedule|sched)
             COMPREPLY=($(compgen -W "$schedule_opts" -- "$cur"))
+            ;;
+        hooks)
+            COMPREPLY=($(compgen -W "--list -l" -- "$cur"))
             ;;
         --interval)
             COMPREPLY=($(compgen -W "$schedule_intervals" -- "$cur"))
@@ -2405,9 +2610,24 @@ _asb_completions() {
                 local backup_root="${ASB_BACKUP_ROOT:-${HOME}/.agent_settings_backups}"
                 local backup_dir="${backup_root}/.${agent}"
                 if [[ -d "$backup_dir/.git" ]]; then
-                    local commits
+                    local commits tags
                     commits=$(git -C "$backup_dir" log --oneline -15 2>/dev/null | cut -d' ' -f1)
-                    COMPREPLY=($(compgen -W "$commits HEAD" -- "$cur"))
+                    tags=$(git -C "$backup_dir" tag -l 2>/dev/null)
+                    COMPREPLY=($(compgen -W "$commits $tags HEAD" -- "$cur"))
+                fi
+            elif [[ "$cmd" == "tag" || "$cmd" == "t" ]] && [[ $COMP_CWORD -eq $((cmd_index + 2)) ]]; then
+                COMPREPLY=($(compgen -W "$tag_opts" -- "$cur"))
+            elif [[ "$cmd" == "tag" || "$cmd" == "t" ]] && [[ $COMP_CWORD -eq $((cmd_index + 3)) ]]; then
+                local prev_arg="${COMP_WORDS[$((COMP_CWORD - 1))]}"
+                if [[ "$prev_arg" == "--delete" || "$prev_arg" == "-d" ]]; then
+                    local agent="${COMP_WORDS[$((cmd_index + 1))]}"
+                    local backup_root="${ASB_BACKUP_ROOT:-${HOME}/.agent_settings_backups}"
+                    local backup_dir="${backup_root}/.${agent}"
+                    if [[ -d "$backup_dir/.git" ]]; then
+                        local tags
+                        tags=$(git -C "$backup_dir" tag -l 2>/dev/null)
+                        COMPREPLY=($(compgen -W "$tags" -- "$cur"))
+                    fi
                 fi
             elif [[ "$cmd" == "export" || "$cmd" == "ex" ]] && [[ $COMP_CWORD -eq $((cmd_index + 2)) ]]; then
                 COMPREPLY=($(compgen -f -- "$cur"))
@@ -2439,7 +2659,9 @@ _asb() {
         'history:Show backup history'
         'diff:Show changes since last backup'
         'verify:Verify backup integrity'
+        'tag:Tag a backup with a name'
         'schedule:Set up automated backups'
+        'hooks:List configured hooks'
         'init:Initialize backup location'
         'config:Manage configuration'
         'completion:Show shell completion script'
@@ -2481,6 +2703,17 @@ _asb() {
         '--status:Show current schedule'
         '--remove:Remove scheduled backup'
         '--help:Show schedule help'
+    )
+
+    tag_opts=(
+        '--list:List all tags'
+        '-l:List all tags'
+        '--delete:Delete a tag'
+        '-d:Delete a tag'
+    )
+
+    hooks_opts=(
+        '--list:List configured hooks'
     )
 
     global_opts=(
@@ -2527,10 +2760,30 @@ _asb() {
                         local backup_root="${ASB_BACKUP_ROOT:-${HOME}/.agent_settings_backups}"
                         local backup_dir="${backup_root}/.${agent}"
                         if [[ -d "$backup_dir/.git" ]]; then
-                            local -a commits
+                            local -a commits tags
                             commits=($(git -C "$backup_dir" log --oneline -15 2>/dev/null | cut -d' ' -f1))
-                            commits+=(HEAD)
-                            _describe 'commit' commits
+                            tags=($(git -C "$backup_dir" tag -l 2>/dev/null))
+                            commits+=(HEAD $tags)
+                            _describe 'commit or tag' commits
+                        fi
+                    fi
+                    ;;
+                tag|t)
+                    if [[ $CURRENT -eq $((cmd_index + 1)) ]]; then
+                        _describe 'agent' agents
+                    elif [[ $CURRENT -eq $((cmd_index + 2)) ]]; then
+                        _describe 'tag option' tag_opts
+                    elif [[ $CURRENT -eq $((cmd_index + 3)) ]]; then
+                        local prev_arg="${words[$((CURRENT-1))]}"
+                        if [[ "$prev_arg" == "--delete" || "$prev_arg" == "-d" ]]; then
+                            local agent="${words[$((cmd_index + 1))]}"
+                            local backup_root="${ASB_BACKUP_ROOT:-${HOME}/.agent_settings_backups}"
+                            local backup_dir="${backup_root}/.${agent}"
+                            if [[ -d "$backup_dir/.git" ]]; then
+                                local -a tags
+                                tags=($(git -C "$backup_dir" tag -l 2>/dev/null))
+                                _describe 'tag' tags
+                            fi
                         fi
                     fi
                     ;;
@@ -2547,6 +2800,9 @@ _asb() {
                     else
                         _describe 'schedule option' schedule_opts
                     fi
+                    ;;
+                hooks)
+                    _describe 'hooks option' hooks_opts
                     ;;
                 import|im)
                     if [[ $CURRENT -eq $((cmd_index + 1)) ]]; then
@@ -2583,7 +2839,9 @@ complete -c asb -n '__fish_use_subcommand' -a list -d 'List all agents and statu
 complete -c asb -n '__fish_use_subcommand' -a history -d 'Show backup history'
 complete -c asb -n '__fish_use_subcommand' -a diff -d 'Show changes since last backup'
 complete -c asb -n '__fish_use_subcommand' -a verify -d 'Verify backup integrity'
+complete -c asb -n '__fish_use_subcommand' -a tag -d 'Tag a backup with a name'
 complete -c asb -n '__fish_use_subcommand' -a schedule -d 'Set up automated backups'
+complete -c asb -n '__fish_use_subcommand' -a hooks -d 'List configured hooks'
 complete -c asb -n '__fish_use_subcommand' -a init -d 'Initialize backup location'
 complete -c asb -n '__fish_use_subcommand' -a config -d 'Manage configuration'
 complete -c asb -n '__fish_use_subcommand' -a completion -d 'Show shell completion script'
@@ -2595,7 +2853,7 @@ complete -c asb -s f -l force -d 'Skip confirmation prompts'
 complete -c asb -s v -l verbose -d 'Show detailed output'
 complete -c asb -s j -l json -d 'Output in JSON format'
 
-set -l agent_commands backup restore history diff verify export
+set -l agent_commands backup restore history diff verify export tag
 
 for cmd in $agent_commands
     complete -c asb -n "__fish_seen_subcommand_from $cmd" -a 'aider' -d 'Aider'
@@ -2627,7 +2885,12 @@ complete -c asb -n '__fish_seen_subcommand_from schedule' -l status -d 'Show cur
 complete -c asb -n '__fish_seen_subcommand_from schedule' -l remove -d 'Remove scheduled backup'
 complete -c asb -n '__fish_seen_subcommand_from schedule' -l help -d 'Show schedule help'
 
+complete -c asb -n '__fish_seen_subcommand_from tag' -s l -l list -d 'List all tags'
+complete -c asb -n '__fish_seen_subcommand_from tag' -s d -l delete -d 'Delete a tag'
+
 complete -c asb -n '__fish_seen_subcommand_from import' -F -a '*.tar.gz'
+
+complete -c asb -n '__fish_seen_subcommand_from hooks' -l list -d 'List configured hooks'
 FISHCOMP
 }
 
@@ -2662,6 +2925,7 @@ ${BOLD}COMMANDS${RESET}
     verify [agents...]        Verify backup integrity (all if none specified)
     tag <agent> <name>        Tag a backup commit with a meaningful name
     schedule [options]        Set up automated scheduled backups
+    hooks --list              List configured hooks
     init                      Initialize backup location
     config [init|show]        Manage configuration
     completion [shell]        Output shell completion script (bash/zsh/fish)
@@ -2893,6 +3157,9 @@ main() {
             ;;
         schedule|sched)
             schedule_backup "$@"
+            ;;
+        hooks)
+            hooks_command "$@"
             ;;
         init|i)
             init_backup_location
