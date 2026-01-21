@@ -96,7 +96,8 @@ run_asb_logged() {
     local description="${1:-command}"
     shift
     log_debug "Running: asb $*"
-    ASB_LAST_OUTPUT=$("$ASB_BIN" "$@" 2>&1) || true
+    # Capture output and status separately (|| true was incorrectly resetting $?)
+    ASB_LAST_OUTPUT=$("$ASB_BIN" "$@" 2>&1)
     ASB_LAST_STATUS=$?
     log_debug "Exit code: $ASB_LAST_STATUS"
     if [[ $ASB_LAST_STATUS -ne 0 ]] && [[ -n "$ASB_LAST_OUTPUT" ]]; then
