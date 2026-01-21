@@ -311,7 +311,7 @@ run_hooks() {
     ASB_SOURCE=$(get_agent_source "$agent")
     export ASB_BACKUP_DIR
     ASB_BACKUP_DIR=$(get_agent_backup_dir "$agent")
-    export ASB_OPERATION="${hook_type%%-*}"
+    export ASB_OPERATION="${hook_type#*-}"
     export ASB_COMMIT="${commit:-}"
 
     for script in "${scripts[@]}"; do
@@ -1169,6 +1169,245 @@ list_backups() {
 
     printf '\n' >&2
     printf "Backup location: %s\n" "$backup_root" >&2
+}
+
+#==============================================================================
+# STATISTICS
+#==============================================================================
+
+# Get size of a directory in human-readable format
+get_dir_size() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        /usr/bin/du -sh "$dir" 2>/dev/null | cut -f1 || echo "?"
+    else
+        echo "0"
+    fi
+}
+
+# Get size of a directory in bytes
+get_dir_size_bytes() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        /usr/bin/du -sb "$dir" 2>/dev/null | cut -f1 || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Calculate changes per week for an agent
+calc_changes_per_week() {
+    local dest="$1"
+    local total_commits="$2"
+
+    if [[ "$total_commits" -eq 0 ]]; then
+        echo "0.0"
+        return
+    fi
+
+    # Get first and last commit dates
+    local first_date last_date
+    first_date=$(git -C "$dest" log --reverse --format="%ct" 2>/dev/null | head -1)
+    last_date=$(git -C "$dest" log -1 --format="%ct" 2>/dev/null)
+
+    if [[ -z "$first_date" || -z "$last_date" ]]; then
+        echo "0.0"
+        return
+    fi
+
+    local days=$(( (last_date - first_date) / 86400 ))
+    if [[ "$days" -lt 1 ]]; then
+        days=1
+    fi
+
+    local weeks
+    weeks=$(echo "scale=1; $days / 7" | bc 2>/dev/null || echo "1")
+    if [[ "$weeks" == "0" || "$weeks" == ".0" ]]; then
+        weeks="1"
+    fi
+
+    echo "scale=1; $total_commits / $weeks" | bc 2>/dev/null || echo "$total_commits"
+}
+
+# Show stats for a single agent
+stats_agent() {
+    local agent="$1"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local dest
+    dest=$(get_agent_backup_dir "$agent")
+
+    if [[ ! -d "$dest/.git" ]]; then
+        if is_json_output; then
+            json_error "No backup found for ${agent}"
+        fi
+        log_error "No backup found for ${agent_name}"
+        return 1
+    fi
+
+    local total_commits first_date first_ago last_date last_ago storage
+    local avg_interval changes_per_week files_tracked
+
+    total_commits=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo "0")
+    storage=$(get_dir_size "$dest")
+    storage_bytes=$(get_dir_size_bytes "$dest")
+
+    if [[ "$total_commits" -gt 0 ]]; then
+        first_date=$(git -C "$dest" log --reverse --format="%ci" 2>/dev/null | head -1 | cut -d' ' -f1)
+        first_ago=$(git -C "$dest" log --reverse --format="%cr" 2>/dev/null | head -1)
+        last_date=$(git -C "$dest" log -1 --format="%ci" 2>/dev/null | cut -d' ' -f1,2)
+        last_ago=$(git -C "$dest" log -1 --format="%cr" 2>/dev/null)
+        changes_per_week=$(calc_changes_per_week "$dest" "$total_commits")
+
+        # Calculate average interval between commits
+        if [[ "$total_commits" -gt 1 ]]; then
+            local first_ts last_ts
+            first_ts=$(git -C "$dest" log --reverse --format="%ct" 2>/dev/null | head -1)
+            last_ts=$(git -C "$dest" log -1 --format="%ct" 2>/dev/null)
+            local total_hours=$(( (last_ts - first_ts) / 3600 ))
+            if [[ "$total_hours" -gt 0 ]]; then
+                avg_interval=$(echo "scale=1; $total_hours / ($total_commits - 1)" | bc 2>/dev/null || echo "?")
+                avg_interval="${avg_interval} hours"
+            else
+                avg_interval="< 1 hour"
+            fi
+        else
+            avg_interval="N/A"
+        fi
+    else
+        first_date="N/A"
+        first_ago="never"
+        last_date="N/A"
+        last_ago="never"
+        avg_interval="N/A"
+        changes_per_week="0"
+    fi
+
+    # Count tracked files (excluding .git)
+    files_tracked=$(find "$dest" -type f ! -path "*/.git/*" 2>/dev/null | wc -l)
+
+    if is_json_output; then
+        json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"total_backups\":${total_commits},\"first_backup\":\"$(json_escape_string "$first_date")\",\"first_backup_ago\":\"$(json_escape_string "$first_ago")\",\"last_backup\":\"$(json_escape_string "$last_date")\",\"last_backup_ago\":\"$(json_escape_string "$last_ago")\",\"storage\":\"$(json_escape_string "$storage")\",\"storage_bytes\":${storage_bytes:-0},\"avg_interval\":\"$(json_escape_string "$avg_interval")\",\"changes_per_week\":${changes_per_week},\"files_tracked\":${files_tracked}}"
+        return 0
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}${agent_name} Statistics${RESET}" >&2
+    printf '%s\n' "────────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    printf "%-18s %s\n" "Total backups:" "$total_commits" >&2
+    printf "%-18s %s (%s)\n" "First backup:" "$first_date" "$first_ago" >&2
+    printf "%-18s %s (%s)\n" "Last backup:" "$last_date" "$last_ago" >&2
+    printf "%-18s %s\n" "Storage used:" "$storage" >&2
+    printf "%-18s %s\n" "Average interval:" "$avg_interval" >&2
+    printf "%-18s %s commits\n" "Changes/week:" "$changes_per_week" >&2
+    printf "%-18s %s\n" "Files tracked:" "$files_tracked" >&2
+    printf '\n' >&2
+}
+
+# Show stats for all agents
+stats_all() {
+    local backup_root
+    backup_root=$(get_backup_root)
+
+    local total_backups=0
+    local total_size_bytes=0
+    local agents_with_backup=0
+
+    # Collect data for all agents
+    local agent_data=()
+
+    for agent in "${!AGENT_FOLDERS[@]}"; do
+        local dest
+        dest=$(get_agent_backup_dir "$agent")
+
+        if [[ -d "$dest/.git" ]]; then
+            local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+            local commits storage last_ago changes_per_week size_bytes
+
+            commits=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo "0")
+            storage=$(get_dir_size "$dest")
+            size_bytes=$(get_dir_size_bytes "$dest")
+            last_ago=$(git -C "$dest" log -1 --format="%cr" 2>/dev/null || echo "never")
+            changes_per_week=$(calc_changes_per_week "$dest" "$commits")
+
+            total_backups=$((total_backups + commits))
+            total_size_bytes=$((total_size_bytes + size_bytes))
+            ((agents_with_backup++))
+
+            agent_data+=("${agent}|${agent_name}|${commits}|${storage}|${last_ago}|${changes_per_week}")
+        fi
+    done
+
+    if [[ ${#agent_data[@]} -eq 0 ]]; then
+        if is_json_output; then
+            json_output "{\"agents\":[],\"total_backups\":0,\"total_storage\":\"0\",\"total_storage_bytes\":0}"
+        else
+            log_warn "No backups found"
+        fi
+        return 0
+    fi
+
+    # Sort by agent name
+    IFS=$'\n' agent_data=($(printf '%s\n' "${agent_data[@]}" | sort)); unset IFS
+
+    # Calculate total storage in human-readable format
+    local total_storage
+    if [[ "$total_size_bytes" -gt 1073741824 ]]; then
+        total_storage="$(echo "scale=1; $total_size_bytes / 1073741824" | bc)G"
+    elif [[ "$total_size_bytes" -gt 1048576 ]]; then
+        total_storage="$(echo "scale=1; $total_size_bytes / 1048576" | bc)M"
+    elif [[ "$total_size_bytes" -gt 1024 ]]; then
+        total_storage="$(echo "scale=1; $total_size_bytes / 1024" | bc)K"
+    else
+        total_storage="${total_size_bytes}B"
+    fi
+
+    if is_json_output; then
+        local json_agents=()
+        for entry in "${agent_data[@]}"; do
+            IFS='|' read -r agent agent_name commits storage last_ago changes_per_week <<< "$entry"
+            json_agents+=("{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"backups\":${commits},\"storage\":\"$(json_escape_string "$storage")\",\"last_backup\":\"$(json_escape_string "$last_ago")\",\"changes_per_week\":${changes_per_week}}")
+        done
+        json_output "{\"agents\":$(json_array "${json_agents[@]}"),\"total_backups\":${total_backups},\"total_storage\":\"$(json_escape_string "$total_storage")\",\"total_storage_bytes\":${total_size_bytes}}"
+        return 0
+    fi
+
+    printf '\n' >&2
+    printf '%b\n' "${BOLD}Backup Statistics${RESET}" >&2
+    printf '%s\n' "────────────────────────────────────────────────────────────────────────" >&2
+    printf '\n' >&2
+
+    # Header
+    printf '%-15s %-8s %-10s %-20s %s\n' "Agent" "Backups" "Size" "Last Backup" "Changes/Week" >&2
+    printf '%s\n' "────────────────────────────────────────────────────────────────────────" >&2
+
+    for entry in "${agent_data[@]}"; do
+        IFS='|' read -r agent agent_name commits storage last_ago changes_per_week <<< "$entry"
+        printf '%-15s %-8s %-10s %-20s %s\n' "$agent" "$commits" "$storage" "$last_ago" "$changes_per_week" >&2
+    done
+
+    printf '\n' >&2
+    printf "Total: %d backups, %s storage across %d agents\n" "$total_backups" "$total_storage" "$agents_with_backup" >&2
+    printf '\n' >&2
+}
+
+# Main stats command handler
+stats_command() {
+    if [[ $# -eq 0 ]]; then
+        stats_all
+    else
+        local agent="$1"
+        if ! agent_exists "$agent"; then
+            if is_json_output; then
+                json_error "Unknown agent: ${agent}"
+            fi
+            log_error "Unknown agent: ${agent}"
+            log_info "Run 'asb list' to see available agents"
+            return 1
+        fi
+        stats_agent "$agent"
+    fi
 }
 
 #==============================================================================
@@ -2558,7 +2797,7 @@ _asb_completions() {
     done
 
     # All commands
-    local commands="backup restore export import list history diff verify tag schedule hooks init config help version completion"
+    local commands="backup restore export import list stats history diff verify tag schedule hooks init config help version completion"
 
     # All agent names (keep in sync with AGENT_FOLDERS)
     local agents="aider amazonq amp claude cline codex cursor factory gemini opencode plandex qwencode windsurf"
@@ -2586,7 +2825,7 @@ _asb_completions() {
         backup|b|verify|v)
             COMPREPLY=($(compgen -W "$agents" -- "$cur"))
             ;;
-        restore|r|history|h|log|diff|d|export|ex|tag|t)
+        restore|r|history|h|log|diff|d|export|ex|tag|t|stats|st)
             COMPREPLY=($(compgen -W "$agents" -- "$cur"))
             ;;
         config|cfg)
@@ -2656,6 +2895,7 @@ _asb() {
         'export:Export backup as archive'
         'import:Import backup from archive'
         'list:List all agents and status'
+        'stats:Show backup statistics'
         'history:Show backup history'
         'diff:Show changes since last backup'
         'verify:Verify backup integrity'
@@ -2752,7 +2992,7 @@ _asb() {
                 backup|b|verify|v)
                     _describe 'agent' agents
                     ;;
-                restore|r|history|h|log|diff|d|export|ex)
+                restore|r|history|h|log|diff|d|export|ex|stats|st)
                     if [[ $CURRENT -eq $((cmd_index + 1)) ]]; then
                         _describe 'agent' agents
                     elif [[ $CURRENT -eq $((cmd_index + 2)) && "$cmd" =~ ^(restore|r)$ ]]; then
@@ -2836,6 +3076,7 @@ complete -c asb -n '__fish_use_subcommand' -a restore -d 'Restore agent from bac
 complete -c asb -n '__fish_use_subcommand' -a export -d 'Export backup as archive'
 complete -c asb -n '__fish_use_subcommand' -a import -d 'Import backup from archive'
 complete -c asb -n '__fish_use_subcommand' -a list -d 'List all agents and status'
+complete -c asb -n '__fish_use_subcommand' -a stats -d 'Show backup statistics'
 complete -c asb -n '__fish_use_subcommand' -a history -d 'Show backup history'
 complete -c asb -n '__fish_use_subcommand' -a diff -d 'Show changes since last backup'
 complete -c asb -n '__fish_use_subcommand' -a verify -d 'Verify backup integrity'
@@ -2920,6 +3161,7 @@ ${BOLD}COMMANDS${RESET}
     export <agent> [file]     Export backup as portable archive
     import <file>             Import backup from archive
     list                      List all agents and backup status
+    stats [agent]             Show backup statistics
     history <agent>           Show backup history for an agent
     diff <agent>              Show changes since last backup
     verify [agents...]        Verify backup integrity (all if none specified)
@@ -3134,6 +3376,9 @@ main() {
             ;;
         list|ls|l)
             list_backups
+            ;;
+        stats|st)
+            stats_command "$@"
             ;;
         history|h|log)
             if [[ $# -lt 1 ]]; then
