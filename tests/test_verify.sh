@@ -106,8 +106,9 @@ test_verify_all_agents() {
 
     run_asb verify
     assert_exit_code 0 "$ASB_LAST_STATUS"
-    assert_contains "$ASB_LAST_OUTPUT" "claude" || return 1
-    assert_contains "$ASB_LAST_OUTPUT" "cursor" || return 1
+    # Check for display names (Claude Code, Cursor)
+    assert_contains "$ASB_LAST_OUTPUT" "Claude" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Cursor" || return 1
 }
 
 test_verify_all_with_some_missing() {

@@ -221,7 +221,7 @@ test_export_with_symlinks() {
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     local export_file="${TEST_ENV_ROOT}/export_symlink.tar.gz"
-    run_asb export claude -o "$export_file"
+    run_asb export claude "$export_file"
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     assert_file_exists "$export_file" || return 1
@@ -244,7 +244,7 @@ test_import_with_symlinks() {
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     local export_file="${TEST_ENV_ROOT}/export_symlink2.tar.gz"
-    run_asb export claude -o "$export_file"
+    run_asb export claude "$export_file"
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     # Clear and reimport

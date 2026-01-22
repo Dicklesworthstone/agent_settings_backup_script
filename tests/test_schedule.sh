@@ -191,9 +191,10 @@ test_schedule_status_no_schedule() {
 # ============================================
 
 test_schedule_both_modes() {
-    # Specifying both --cron and --systemd might error or use last one
+    # Specifying both --cron and --systemd should error
     run_asb --dry-run schedule --cron --systemd
-    # Implementation-dependent behavior
+    assert_exit_code 1 "$ASB_LAST_STATUS"
+    assert_output_contains "$ASB_LAST_OUTPUT" "Choose only one"
 }
 
 test_schedule_status_both_modes() {

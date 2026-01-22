@@ -2770,7 +2770,9 @@ verify_all() {
         local dest
         dest=$(get_agent_backup_dir "$agent")
         if [[ ! -d "$dest" ]]; then
-            log_debug "Skipping $agent: no backup exists"
+            local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+            log_warn "${agent_name}: No backup found"
+            ((skipped++))
             continue
         fi
 
@@ -2784,10 +2786,12 @@ verify_all() {
     # Summary
     printf '\n' >&2
     printf '%s\n' "────────────────────────────────────────────────────────────" >&2
-    if [[ "$failed" -eq 0 ]]; then
+    if [[ "$failed" -eq 0 && "$skipped" -eq 0 ]]; then
         log_success "All backups verified: ${verified} OK"
+    elif [[ "$failed" -eq 0 ]]; then
+        log_warn "Verification complete: ${verified} OK, ${skipped} not found"
     else
-        log_warn "Verification complete: ${verified} OK, ${failed} failed"
+        log_warn "Verification complete: ${verified} OK, ${failed} failed, ${skipped} not found"
     fi
 
     [[ "$failed" -eq 0 ]]

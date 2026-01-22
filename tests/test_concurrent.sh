@@ -184,9 +184,9 @@ test_concurrent_export() {
     local export2="${TEST_ENV_ROOT}/export2.tar.gz"
 
     # Export same agent to different files
-    run_asb export claude -o "$export1" &
+    run_asb export claude "$export1" &
     local pid1=$!
-    run_asb export claude -o "$export2" &
+    run_asb export claude "$export2" &
     local pid2=$!
 
     wait $pid1
