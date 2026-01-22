@@ -254,6 +254,48 @@ asb discover --auto
 asb --json discover --list
 ```
 
+### JSON Output
+
+All commands support `--json` for machine-readable output, ideal for scripting and automation:
+
+```bash
+# Backup with JSON output
+asb --json backup claude
+# {"agent":"claude","name":"Claude Code","status":"success","commit":"abc1234","changes":5}
+
+# Backup all agents
+asb --json backup
+# {"results":[...],"summary":{"backed_up":3,"skipped":2,"failed":0}}
+
+# Restore with JSON (requires --force for non-interactive)
+asb --json --force restore claude
+# {"agent":"claude","name":"Claude Code","status":"success","source":"abc1234","destination":"/home/user/.claude"}
+
+# Export with JSON
+asb --json export claude
+# {"agent":"claude","name":"Claude Code","status":"success","output":"/path/to/backup.tar.gz","size":"1.2M","size_bytes":1258291,"commits":15}
+
+# Import with JSON
+asb --json import backup.tar.gz
+# {"status":"success","archive":"/path/to/backup.tar.gz","destination":"/home/user/.agent_settings_backups/.claude","agent_folder":".claude"}
+
+# Diff with JSON
+asb --json diff claude
+# {"agent":"claude","name":"Claude Code","status":"success","has_changes":true,"added":["new_file.json"],"removed":[],"modified":["settings.json"]}
+
+# List agents
+asb --json list
+# {"agents":[{"name":"claude","display_name":"Claude Code","installed":true,"backup_exists":true},...]}
+
+# History
+asb --json history claude
+# {"agent":"claude","commits":[{"hash":"abc1234","date":"2024-01-15","message":"Backup..."},...]}
+
+# Stats
+asb --json stats claude
+# {"agent":"claude","name":"Claude Code","backup_size":"2.5M","commits":42,"last_backup":"2024-01-15 10:30:00"}
+```
+
 ## Portability
 
 Export backups for transfer between machines:
