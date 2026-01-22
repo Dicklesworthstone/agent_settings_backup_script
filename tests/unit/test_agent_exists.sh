@@ -67,6 +67,17 @@ test_special_characters() {
     assert_function_fails agent_exists "agent name" || return 1
 }
 
+# Test custom agents loaded from config
+test_custom_agent_loaded() {
+    local custom_file="${XDG_CONFIG_HOME}/asb/custom_agents"
+    mkdir -p "${XDG_CONFIG_HOME}/asb"
+    echo "myagent=.myagent" > "$custom_file"
+
+    load_custom_agents
+
+    assert_function_succeeds agent_exists "myagent" || return 1
+}
+
 # Test all primary agents exist
 test_all_primary_agents() {
     local agents=("claude" "codex" "cursor" "gemini" "cline" "amp" "aider" "opencode" "factory" "windsurf" "plandex" "qwencode" "amazonq")
@@ -96,4 +107,5 @@ run_unit_test "case_sensitivity_uppercase" test_case_sensitivity_uppercase
 run_unit_test "case_sensitivity_mixed" test_case_sensitivity_mixed
 run_unit_test "empty_string" test_empty_string
 run_unit_test "special_characters" test_special_characters
+run_unit_test "custom_agent_loaded" test_custom_agent_loaded
 run_unit_test "all_primary_agents" test_all_primary_agents

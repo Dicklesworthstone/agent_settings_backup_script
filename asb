@@ -474,60 +474,71 @@ backup_agent() {
     dest=$(get_agent_backup_dir "$agent")
 
     if [[ ! -d "$source" ]]; then
-        log_warn "${agent_name} not found at ${source}"
+        if ! is_json_output; then
+            log_warn "${agent_name} not found at ${source}"
+        fi
+        # Set result for JSON collection by backup_all
+        BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"not_found\",\"source\":\"$(json_escape_string "$source")\"}"
         return 1
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "${DIM}[DRY RUN]${RESET} Would backup ${agent_name}"
-        log_info "${DIM}[DRY RUN]${RESET} Source: ${source}"
-        log_info "${DIM}[DRY RUN]${RESET} Destination: ${dest}"
+        if ! is_json_output; then
+            log_info "${DIM}[DRY RUN]${RESET} Would backup ${agent_name}"
+            log_info "${DIM}[DRY RUN]${RESET} Source: ${source}"
+            log_info "${DIM}[DRY RUN]${RESET} Destination: ${dest}"
 
-        if command_exists rsync; then
-            if [[ -d "$dest" ]]; then
-                local changes
-                changes=$(rsync -a --delete --checksum --dry-run --itemize-changes \
-                    --exclude='.git' \
-                    --exclude='.gitignore' \
-                    --exclude='*.log' \
-                    --exclude='cache/' \
-                    --exclude='Cache/' \
-                    --exclude='.cache/' \
-                    --exclude='*.sqlite3-wal' \
-                    --exclude='*.sqlite3-shm' \
-                    "$source/" "$dest/" 2>/dev/null | head -30)
+            if command_exists rsync; then
+                if [[ -d "$dest" ]]; then
+                    local changes
+                    changes=$(rsync -a --delete --checksum --dry-run --itemize-changes \
+                        --exclude='.git' \
+                        --exclude='.gitignore' \
+                        --exclude='*.log' \
+                        --exclude='cache/' \
+                        --exclude='Cache/' \
+                        --exclude='.cache/' \
+                        --exclude='*.sqlite3-wal' \
+                        --exclude='*.sqlite3-shm' \
+                        "$source/" "$dest/" 2>/dev/null | head -30)
 
-                if [[ -n "$changes" ]]; then
-                    log_info "${DIM}[DRY RUN]${RESET} Files that would be synced:"
-                    echo "$changes" | while IFS= read -r line; do
-                        echo "  $line" >&2
-                    done
+                    if [[ -n "$changes" ]]; then
+                        log_info "${DIM}[DRY RUN]${RESET} Files that would be synced:"
+                        echo "$changes" | while IFS= read -r line; do
+                            echo "  $line" >&2
+                        done
+                    else
+                        log_info "${DIM}[DRY RUN]${RESET} No file changes detected"
+                    fi
                 else
-                    log_info "${DIM}[DRY RUN]${RESET} No file changes detected"
+                    log_info "${DIM}[DRY RUN]${RESET} Destination does not exist; all files would be copied"
                 fi
-            else
-                log_info "${DIM}[DRY RUN]${RESET} Destination does not exist; all files would be copied"
+            fi
+
+            if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
+                if [[ -d "$dest/.git" ]]; then
+                    log_info "${DIM}[DRY RUN]${RESET} Would create backup commit"
+                else
+                    log_info "${DIM}[DRY RUN]${RESET} Would initialize git repo and create initial commit"
+                fi
             fi
         fi
 
-        if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
-            if [[ -d "$dest/.git" ]]; then
-                log_info "${DIM}[DRY RUN]${RESET} Would create backup commit"
-            else
-                log_info "${DIM}[DRY RUN]${RESET} Would initialize git repo and create initial commit"
-            fi
-        fi
-
+        # Set result for JSON collection by backup_all
+        BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"dry_run\",\"source\":\"$(json_escape_string "$source")\",\"destination\":\"$(json_escape_string "$dest")\"}"
         return 0
     fi
 
     if ! run_hooks "pre-backup" "$agent"; then
+        BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"hook_failed\",\"hook\":\"pre-backup\"}"
         return 1
     fi
 
-    log_step "Backing up ${agent_name}..."
-    log_debug "Source: ${source}"
-    log_debug "Destination: ${dest}"
+    if ! is_json_output; then
+        log_step "Backing up ${agent_name}..."
+        log_debug "Source: ${source}"
+        log_debug "Destination: ${dest}"
+    fi
 
     # Create backup directory if needed
     mkdir -p "$dest"
@@ -548,7 +559,9 @@ backup_agent() {
             --exclude='*.sqlite3-wal' \
             --exclude='*.sqlite3-shm' \
             "$source/" "$dest/" 2>/dev/null; then
-            log_warn "rsync failed; falling back to cp"
+            if ! is_json_output; then
+                log_warn "rsync failed; falling back to cp"
+            fi
             needs_fallback=true
         fi
     else
@@ -577,14 +590,30 @@ backup_agent() {
 
     # Create commit if auto-commit is enabled
     local hook_commit=""
+    local commit_created=false
     if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
         create_backup_commit "$dest" "$agent"
         hook_commit="$LAST_BACKUP_COMMIT"
+        [[ -n "$hook_commit" ]] && commit_created=true
     else
         hook_commit=$(git -C "$dest" rev-parse --short HEAD 2>/dev/null || echo "")
     fi
 
     run_hooks "post-backup" "$agent" "$hook_commit" || true
+
+    # Build JSON result
+    local json_result="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"success\""
+    json_result+=",\"source\":\"$(json_escape_string "$source")\",\"destination\":\"$(json_escape_string "$dest")\""
+    if [[ -n "$hook_commit" ]]; then
+        json_result+=",\"commit\":\"${hook_commit}\""
+    fi
+    if [[ "$commit_created" == "true" ]]; then
+        json_result+=",\"changes\":true"
+    else
+        json_result+=",\"changes\":false"
+    fi
+    json_result+="}"
+    BACKUP_AGENT_RESULT="$json_result"
 
     return 0
 }
@@ -594,6 +623,7 @@ backup_all() {
     local backed_up=0
     local failed=0
     local skipped=0
+    local json_results=()
 
     # If no specific agents, backup all detected
     if [[ ${#agents[@]} -eq 0 ]]; then
@@ -602,41 +632,68 @@ backup_all() {
         done
     fi
 
-    printf '\n' >&2
-    if [[ "$DRY_RUN" == "true" ]]; then
-        printf '%b\n' "${BOLD}Agent Settings Backup ${DIM}[DRY RUN]${RESET}" >&2
-    else
-        printf '%b\n' "${BOLD}Agent Settings Backup${RESET}" >&2
+    if ! is_json_output; then
+        printf '\n' >&2
+        if [[ "$DRY_RUN" == "true" ]]; then
+            printf '%b\n' "${BOLD}Agent Settings Backup ${DIM}[DRY RUN]${RESET}" >&2
+        else
+            printf '%b\n' "${BOLD}Agent Settings Backup${RESET}" >&2
+        fi
+        printf '%s\n' "─────────────────────────" >&2
+        printf '\n' >&2
     fi
-    printf '%s\n' "─────────────────────────" >&2
-    printf '\n' >&2
 
     for agent in "${agents[@]}"; do
+        BACKUP_AGENT_RESULT=""
+
         if ! agent_exists "$agent"; then
-            log_error "Unknown agent: ${agent}"
+            if ! is_json_output; then
+                log_error "Unknown agent: ${agent}"
+            fi
+            json_results+=("{\"agent\":\"${agent}\",\"status\":\"unknown_agent\"}")
             ((failed++))
             continue
         fi
 
         if ! agent_source_exists "$agent"; then
             log_debug "Skipping ${agent} (not installed)"
+            local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+            json_results+=("{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"skipped\",\"reason\":\"not_installed\"}")
             ((skipped++))
             continue
         fi
 
         if backup_agent "$agent"; then
             ((backed_up++))
+            if ! is_json_output; then
+                local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+                log_success "Backed up ${agent_name}"
+            fi
         else
             ((failed++))
         fi
+
+        # Collect JSON result from backup_agent
+        if [[ -n "$BACKUP_AGENT_RESULT" ]]; then
+            json_results+=("$BACKUP_AGENT_RESULT")
+        fi
     done
 
-    printf '\n' >&2
-    printf '%s\n' "─────────────────────────" >&2
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would backup ${backed_up}, skip ${skipped}, fail ${failed}"
+    if is_json_output; then
+        local result="{\"results\":$(json_array "${json_results[@]}"),\"summary\":{\"backed_up\":${backed_up},\"skipped\":${skipped},\"failed\":${failed}}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            result+=",\"dry_run\":true"
+        fi
+        result+="}"
+        json_output "$result"
     else
-        log_info "Summary: ${backed_up} backed up, ${skipped} skipped, ${failed} failed"
+        printf '\n' >&2
+        printf '%s\n' "─────────────────────────" >&2
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would backup ${backed_up}, skip ${skipped}, fail ${failed}"
+        else
+            log_info "Summary: ${backed_up} backed up, ${skipped} skipped, ${failed} failed"
+        fi
     fi
 
     [[ $failed -eq 0 ]]
@@ -829,7 +886,11 @@ restore_agent() {
     dest=$(get_agent_source "$agent")
 
     if [[ ! -d "$source/.git" ]]; then
-        log_error "No backup found for ${agent_name}"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"no_backup_found\"}"
+        else
+            log_error "No backup found for ${agent_name}"
+        fi
         return 1
     fi
 
@@ -837,47 +898,103 @@ restore_agent() {
     if git -C "$source" rev-parse --verify "refs/tags/${commit_ref}" >/dev/null 2>&1; then
         commit=$(git -C "$source" rev-parse "refs/tags/${commit_ref}")
         is_tag=true
-        log_info "Restoring from tag '${commit_ref}'"
+        if ! is_json_output; then
+            log_info "Restoring from tag '${commit_ref}'"
+        fi
     elif git -C "$source" rev-parse --verify "$commit_ref" >/dev/null 2>&1; then
         commit=$(git -C "$source" rev-parse "$commit_ref")
     else
-        log_error "Invalid commit or tag: ${commit_ref}"
-        log_info "Run 'asb history ${agent}' to see valid commits"
-        log_info "Run 'asb tag ${agent} --list' to see available tags"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"invalid_commit_or_tag\",\"ref\":\"$(json_escape_string "$commit_ref")\"}"
+        else
+            log_error "Invalid commit or tag: ${commit_ref}"
+            log_info "Run 'asb history ${agent}' to see valid commits"
+            log_info "Run 'asb tag ${agent} --list' to see available tags"
+        fi
         return 1
     fi
 
-    # Show preview (works in both normal and dry-run mode)
-    if ! show_restore_preview "$source" "$dest" "$commit" "$agent_name"; then
-        log_error "Could not generate restore preview"
-        return 1
+    # Show preview (works in both normal and dry-run mode, but skip in JSON mode)
+    if ! is_json_output; then
+        if ! show_restore_preview "$source" "$dest" "$commit" "$agent_name"; then
+            log_error "Could not generate restore preview"
+            return 1
+        fi
+    else
+        # In JSON mode, we still need to check if there are changes
+        local temp_backup
+        temp_backup=$(mktemp -d)
+        trap "rm -rf '$temp_backup'" RETURN
+
+        if git -C "$source" archive "$commit" 2>/dev/null | tar -C "$temp_backup" -xf - 2>/dev/null; then
+            if [[ -d "$dest" ]]; then
+                local diff_output
+                diff_output=$(diff -rq "$dest" "$temp_backup" \
+                    --exclude='.git' --exclude='.gitignore' \
+                    --exclude='*.log' --exclude='cache' --exclude='Cache' --exclude='.cache' 2>/dev/null || true)
+                if [[ -n "$diff_output" ]]; then
+                    RESTORE_HAS_CHANGES=true
+                else
+                    RESTORE_HAS_CHANGES=false
+                fi
+            else
+                RESTORE_HAS_CHANGES=true
+            fi
+        fi
     fi
 
     if [[ "$RESTORE_HAS_CHANGES" != "true" ]]; then
-        log_info "Already up to date; no changes to restore"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"no_changes\",\"commit\":\"$(git -C "$source" rev-parse --short "$commit" 2>/dev/null)\"}"
+        else
+            log_info "Already up to date; no changes to restore"
+        fi
         return 0
     fi
 
     # Dry-run exits here
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would restore ${agent_name} from ${commit}"
+        local short_commit
+        short_commit=$(git -C "$source" rev-parse --short "$commit" 2>/dev/null)
+        if is_json_output; then
+            local result="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"dry_run\""
+            result+=",\"commit\":\"${short_commit}\",\"source\":\"$(json_escape_string "$source")\",\"destination\":\"$(json_escape_string "$dest")\""
+            if [[ "$is_tag" == "true" ]]; then
+                result+=",\"tag\":\"$(json_escape_string "$commit_ref")\""
+            fi
+            result+="}"
+            json_output "$result"
+        else
+            log_info "[DRY RUN] Would restore ${agent_name} from ${commit}"
+        fi
         return 0
     fi
 
-    # Get confirmation
-    if ! confirm_restore; then
+    # Get confirmation (skip in JSON mode as it's non-interactive)
+    if ! is_json_output; then
+        if ! confirm_restore; then
+            return 1
+        fi
+    elif [[ "$FORCE" != "true" ]]; then
+        # JSON mode requires --force for non-interactive restore
+        json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"confirmation_required\",\"message\":\"Use --force for non-interactive restore\"}"
         return 1
     fi
 
     if ! run_hooks "pre-restore" "$agent" "$commit"; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"pre_restore_hook_failed\"}"
+        fi
         return 1
     fi
 
     # === PROCEED WITH RESTORE ===
-    log_step "Restoring ${agent_name} from backup..."
-    log_debug "Backup: ${source}"
-    log_debug "Destination: ${dest}"
-    log_debug "Commit: ${commit}"
+    if ! is_json_output; then
+        log_step "Restoring ${agent_name} from backup..."
+        log_debug "Backup: ${source}"
+        log_debug "Destination: ${dest}"
+        log_debug "Commit: ${commit}"
+    fi
 
     # Create destination if needed
     mkdir -p "$dest"
@@ -885,7 +1002,11 @@ restore_agent() {
     # If restoring a specific commit, checkout that commit first
     if [[ "$commit" != "HEAD" ]]; then
         git -C "$source" checkout "$commit" -- . >/dev/null 2>&1 || {
-            log_error "Failed to checkout commit: ${commit}"
+            if is_json_output; then
+                json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"checkout_failed\",\"commit\":\"$(json_escape_string "$commit")\"}"
+            else
+                log_error "Failed to checkout commit: ${commit}"
+            fi
             return 1
         }
     fi
@@ -897,7 +1018,9 @@ restore_agent() {
             --exclude='.git' \
             --exclude='.gitignore' \
             "$source/" "$dest/" 2>/dev/null; then
-            log_warn "rsync failed; falling back to cp"
+            if ! is_json_output; then
+                log_warn "rsync failed; falling back to cp"
+            fi
             needs_fallback=true
         fi
     else
@@ -919,8 +1042,21 @@ restore_agent() {
         git -C "$source" checkout HEAD -- . >/dev/null 2>&1
     fi
 
-    log_success "Restored ${agent_name} from backup"
     run_hooks "post-restore" "$agent" "$commit" || true
+
+    local short_commit
+    short_commit=$(git -C "$source" rev-parse --short "$commit" 2>/dev/null)
+    if is_json_output; then
+        local result="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"success\""
+        result+=",\"commit\":\"${short_commit}\",\"source\":\"$(json_escape_string "$source")\",\"destination\":\"$(json_escape_string "$dest")\""
+        if [[ "$is_tag" == "true" ]]; then
+            result+=",\"tag\":\"$(json_escape_string "$commit_ref")\""
+        fi
+        result+="}"
+        json_output "$result"
+    else
+        log_success "Restored ${agent_name} from backup"
+    fi
     return 0
 }
 
@@ -939,8 +1075,12 @@ export_backup() {
 
     # Validate backup exists
     if [[ ! -d "$source/.git" ]]; then
-        log_error "No backup found for ${agent_name}"
-        log_info "Run 'asb backup ${agent}' first"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"no_backup_found\"}"
+        else
+            log_error "No backup found for ${agent_name}"
+            log_info "Run 'asb backup ${agent}' first"
+        fi
         return 1
     fi
 
@@ -949,57 +1089,75 @@ export_backup() {
         output="${agent}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
     fi
 
+    local size_estimate
+    size_estimate=$(du -sh "$source" 2>/dev/null | cut -f1)
+    local commit_count
+    commit_count=$(git -C "$source" rev-list --count HEAD 2>/dev/null || echo "0")
+
     # Dry-run mode
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would export ${agent_name}"
-        log_info "[DRY RUN] Source: ${source}"
-        log_info "[DRY RUN] Output: ${output}"
-
-        local size
-        size=$(du -sh "$source" 2>/dev/null | cut -f1)
-        log_info "[DRY RUN] Archive would contain ${size} of data"
-
-        local commit_count
-        commit_count=$(git -C "$source" rev-list --count HEAD 2>/dev/null || echo "?")
-        log_info "[DRY RUN] Including ${commit_count} backup commits"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"dry_run\",\"output\":\"$(json_escape_string "$output")\",\"source\":\"$(json_escape_string "$source")\",\"size_estimate\":\"$(json_escape_string "$size_estimate")\",\"commits\":${commit_count}}"
+        else
+            log_info "[DRY RUN] Would export ${agent_name}"
+            log_info "[DRY RUN] Source: ${source}"
+            log_info "[DRY RUN] Output: ${output}"
+            log_info "[DRY RUN] Archive would contain ${size_estimate} of data"
+            log_info "[DRY RUN] Including ${commit_count} backup commits"
+        fi
         return 0
     fi
 
-    log_step "Exporting ${agent_name}..."
-    log_debug "Source: ${source}"
-    log_debug "Output: ${output}"
+    if ! is_json_output; then
+        log_step "Exporting ${agent_name}..."
+        log_debug "Source: ${source}"
+        log_debug "Output: ${output}"
+    fi
 
     local backup_root
     backup_root=$(get_backup_root)
 
+    # Pipe to stdout mode (no JSON output for this mode)
     if [[ "$output" == "-" ]]; then
         tar -czf - -C "$backup_root" "$folder" 2>/dev/null
         return $?
     fi
 
     if [[ -f "$output" ]] && [[ "$FORCE" != "true" ]]; then
-        log_error "Output file already exists: ${output}"
-        log_info "Use --force to overwrite, or specify different filename"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"file_exists\",\"output\":\"$(json_escape_string "$output")\"}"
+        else
+            log_error "Output file already exists: ${output}"
+            log_info "Use --force to overwrite, or specify different filename"
+        fi
         return 1
     fi
 
     tar -czf "$output" -C "$backup_root" "$folder" 2>/dev/null
 
     if [[ ! -f "$output" ]]; then
-        log_error "Failed to create archive"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"archive_failed\"}"
+        else
+            log_error "Failed to create archive"
+        fi
         return 1
     fi
 
     local size
     size=$(du -h "$output" | cut -f1)
-    local commit_count
-    commit_count=$(git -C "$source" rev-list --count HEAD 2>/dev/null || echo "?")
+    local size_bytes
+    size_bytes=$(stat -c%s "$output" 2>/dev/null || stat -f%z "$output" 2>/dev/null || echo "0")
 
-    log_success "Exported ${agent_name}"
-    printf '\n' >&2
-    printf "  File:     %s\n" "$output" >&2
-    printf "  Size:     %s\n" "$size" >&2
-    printf "  History:  %s commits\n" "$commit_count" >&2
+    if is_json_output; then
+        json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"success\",\"output\":\"$(json_escape_string "$output")\",\"size\":\"$(json_escape_string "$size")\",\"size_bytes\":${size_bytes},\"commits\":${commit_count}}"
+    else
+        log_success "Exported ${agent_name}"
+        printf '\n' >&2
+        printf "  File:     %s\n" "$output" >&2
+        printf "  Size:     %s\n" "$size" >&2
+        printf "  History:  %s commits\n" "$commit_count" >&2
+    fi
 
     return 0
 }
@@ -1010,49 +1168,87 @@ import_backup() {
     backup_root=$(get_backup_root)
 
     if [[ "$archive" != "-" ]] && [[ ! -f "$archive" ]]; then
-        log_error "Archive not found: ${archive}"
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"archive_not_found\",\"archive\":\"$(json_escape_string "$archive")\"}"
+        else
+            log_error "Archive not found: ${archive}"
+        fi
         return 1
     fi
 
-    # Dry-run mode
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would import from ${archive}"
-        log_info "[DRY RUN] Destination: ${backup_root}"
-
-        if [[ "$archive" != "-" ]]; then
-            log_info "[DRY RUN] Archive contents:"
-            tar -tzf "$archive" 2>/dev/null | head -10
-        fi
-        return 0
-    fi
-
-    log_step "Importing backup..."
-
-    # Create backup location if needed
-    mkdir -p "$backup_root"
-
-    # Peek at archive to detect agent folder
+    # Peek at archive to detect agent folder (needed for dry-run and JSON too)
     local agent_folder=""
     if [[ "$archive" != "-" ]]; then
         local archive_list
         if ! archive_list=$(tar -tzf "$archive" 2>/dev/null); then
-            log_error "Failed to read archive"
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"archive_read_failed\",\"archive\":\"$(json_escape_string "$archive")\"}"
+            else
+                log_error "Failed to read archive"
+            fi
             return 1
         fi
         agent_folder=$(printf '%s\n' "$archive_list" | awk -F/ '{ gsub(/^\.\//, "", $0); if (NF > 1 && $1 != "" && $1 != ".") { print $1; exit } }')
         if [[ -z "$agent_folder" ]]; then
-            log_error "Archive does not contain a top-level directory"
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"invalid_archive_structure\",\"message\":\"Archive does not contain a top-level directory\"}"
+            else
+                log_error "Archive does not contain a top-level directory"
+            fi
             return 1
         fi
         if [[ "$agent_folder" == "." || "$agent_folder" == ".." || "$agent_folder" == *"/"* ]]; then
-            log_error "Invalid archive root: ${agent_folder}"
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"invalid_archive_root\",\"folder\":\"$(json_escape_string "$agent_folder")\"}"
+            else
+                log_error "Invalid archive root: ${agent_folder}"
+            fi
             return 1
         fi
     fi
 
+    # Dry-run mode
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local would_overwrite=false
+        if [[ -n "$agent_folder" ]] && [[ -d "$backup_root/$agent_folder" ]]; then
+            would_overwrite=true
+        fi
+        if is_json_output; then
+            local result="{\"status\":\"dry_run\",\"archive\":\"$(json_escape_string "$archive")\",\"destination\":\"$(json_escape_string "$backup_root")\""
+            if [[ -n "$agent_folder" ]]; then
+                result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
+            fi
+            result+=",\"would_overwrite\":${would_overwrite}}"
+            json_output "$result"
+        else
+            log_info "[DRY RUN] Would import from ${archive}"
+            log_info "[DRY RUN] Destination: ${backup_root}"
+            if [[ "$archive" != "-" ]]; then
+                log_info "[DRY RUN] Archive contents:"
+                tar -tzf "$archive" 2>/dev/null | head -10
+            fi
+            if [[ "$would_overwrite" == "true" ]]; then
+                log_info "[DRY RUN] Would overwrite existing backup: $backup_root/$agent_folder"
+            fi
+        fi
+        return 0
+    fi
+
+    if ! is_json_output; then
+        log_step "Importing backup..."
+    fi
+
+    # Create backup location if needed
+    mkdir -p "$backup_root"
+
     # Check for existing backup (conflict detection)
     if [[ -n "$agent_folder" ]] && [[ -d "$backup_root/$agent_folder" ]]; then
         if [[ "$FORCE" != "true" ]]; then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"backup_exists\",\"folder\":\"$(json_escape_string "$backup_root/$agent_folder")\",\"message\":\"Use --force to overwrite existing backup\"}"
+                return 1
+            fi
+
             log_warn "Backup already exists: $backup_root/$agent_folder"
 
             if [[ -t 0 ]]; then
@@ -1085,13 +1281,26 @@ import_backup() {
     fi
 
     if [[ $tar_exit -ne 0 ]]; then
-        log_error "Failed to extract archive"
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"extract_failed\"}"
+        else
+            log_error "Failed to extract archive"
+        fi
         return 1
     fi
 
-    log_success "Imported backup"
-    log_info "Destination: ${backup_root}"
-    log_info "Run 'asb list' to see imported backups"
+    if is_json_output; then
+        local result="{\"status\":\"success\",\"destination\":\"$(json_escape_string "$backup_root")\""
+        if [[ -n "$agent_folder" ]]; then
+            result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
+        fi
+        result+="}"
+        json_output "$result"
+    else
+        log_success "Imported backup"
+        log_info "Destination: ${backup_root}"
+        log_info "Run 'asb list' to see imported backups"
+    fi
 
     return 0
 }
@@ -1750,19 +1959,22 @@ show_diff() {
     dest=$(get_agent_backup_dir "$agent")
 
     if [[ ! -d "$source" ]]; then
-        log_error "${agent_name} not installed"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"not_installed\"}"
+        else
+            log_error "${agent_name} not installed"
+        fi
         return 1
     fi
 
     if [[ ! -d "$dest/.git" ]]; then
-        log_error "No backup found for ${agent_name}"
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"no_backup_found\"}"
+        else
+            log_error "No backup found for ${agent_name}"
+        fi
         return 1
     fi
-
-    printf '\n' >&2
-    printf '%b\n' "${BOLD}Changes since last backup: ${agent_name}${RESET}" >&2
-    printf '%s\n' "─────────────────────────────────────────────" >&2
-    printf '\n' >&2
 
     # Create a temp copy of current state
     local temp_dir
@@ -1778,16 +1990,70 @@ show_diff() {
     cp -r "$source"/. "$temp_dir/" 2>/dev/null || true
 
     # Compare with backup
-    diff -rq "$dest" "$temp_dir" \
+    local diff_output
+    diff_output=$(diff -rq "$dest" "$temp_dir" \
         --exclude='.git' \
         --exclude='.gitignore' \
         --exclude='*.log' \
         --exclude='cache' \
         --exclude='Cache' \
         --exclude='.cache' \
-        2>/dev/null || true
+        2>/dev/null || true)
 
-    printf '\n' >&2
+    if is_json_output; then
+        local added=()
+        local removed=()
+        local modified=()
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == "Only in $dest"* ]]; then
+                # File only in backup (will be added on restore / was deleted)
+                local file="${line#Only in $dest}"
+                file="${file#/: }"
+                file="${file#: }"
+                removed+=("\"$(json_escape_string "$file")\"")
+            elif [[ "$line" == "Only in $temp_dir"* ]]; then
+                # File only in current (new file)
+                local file="${line#Only in $temp_dir}"
+                file="${file#/: }"
+                file="${file#: }"
+                added+=("\"$(json_escape_string "$file")\"")
+            elif [[ "$line" == "Files "* && "$line" == *" differ" ]]; then
+                # File differs
+                local file="${line#Files }"
+                file="${file%% and *}"
+                file="${file#$dest/}"
+                modified+=("\"$(json_escape_string "$file")\"")
+            fi
+        done <<< "$diff_output"
+
+        local has_changes=false
+        if [[ ${#added[@]} -gt 0 || ${#removed[@]} -gt 0 || ${#modified[@]} -gt 0 ]]; then
+            has_changes=true
+        fi
+
+        local result="{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"success\""
+        result+=",\"has_changes\":${has_changes}"
+        result+=",\"added\":$(json_array "${added[@]}")"
+        result+=",\"removed\":$(json_array "${removed[@]}")"
+        result+=",\"modified\":$(json_array "${modified[@]}")"
+        result+="}"
+        json_output "$result"
+    else
+        printf '\n' >&2
+        printf '%b\n' "${BOLD}Changes since last backup: ${agent_name}${RESET}" >&2
+        printf '%s\n' "─────────────────────────────────────────────" >&2
+        printf '\n' >&2
+
+        if [[ -n "$diff_output" ]]; then
+            echo "$diff_output" >&2
+        else
+            log_info "No changes since last backup"
+        fi
+
+        printf '\n' >&2
+    fi
 }
 
 #==============================================================================

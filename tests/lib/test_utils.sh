@@ -83,20 +83,6 @@ skip_test() {
     return 2
 }
 
-skip_if_missing() {
-    local cmd="$1"
-    local message="${2:-}"
-    if ! command_exists "$cmd"; then
-        if [[ -n "$message" ]]; then
-            skip_test "$message"
-        else
-            skip_test "Missing dependency: $cmd"
-        fi
-        return 2
-    fi
-    return 0
-}
-
 run_test() {
     local test_name="$1"
     local func="$2"

@@ -97,6 +97,63 @@ test_log_special_characters() {
     assert_contains "$output" "quotes" || return 1
 }
 
+# Test log functions write only to stderr
+test_log_info_stderr_only() {
+    local stdout stderr
+    stdout=$(capture_stdout log_info "stderr test")
+    stderr=$(capture_stderr log_info "stderr test")
+
+    assert_equals "" "$stdout" || return 1
+    assert_contains "$stderr" "stderr test" || return 1
+}
+
+test_log_warn_stderr_only() {
+    local stdout stderr
+    stdout=$(capture_stdout log_warn "stderr test")
+    stderr=$(capture_stderr log_warn "stderr test")
+
+    assert_equals "" "$stdout" || return 1
+    assert_contains "$stderr" "stderr test" || return 1
+}
+
+test_log_error_stderr_only() {
+    local stdout stderr
+    stdout=$(capture_stdout log_error "stderr test")
+    stderr=$(capture_stderr log_error "stderr test")
+
+    assert_equals "" "$stdout" || return 1
+    assert_contains "$stderr" "stderr test" || return 1
+}
+
+test_log_success_stderr_only() {
+    local stdout stderr
+    stdout=$(capture_stdout log_success "stderr test")
+    stderr=$(capture_stderr log_success "stderr test")
+
+    assert_equals "" "$stdout" || return 1
+    assert_contains "$stderr" "stderr test" || return 1
+}
+
+test_log_step_stderr_only() {
+    local stdout stderr
+    stdout=$(capture_stdout log_step "stderr test")
+    stderr=$(capture_stderr log_step "stderr test")
+
+    assert_equals "" "$stdout" || return 1
+    assert_contains "$stderr" "stderr test" || return 1
+}
+
+# Test non-TTY output does not include ANSI codes
+test_no_color_non_tty() {
+    local output
+    output=$(bash -c 'ASB_SOURCED=true source "'"$REPO_ROOT"'/asb"; log_info "test"' 2>&1)
+
+    if [[ "$output" == *$'\033'* ]] || [[ "$output" == *$'\e'* ]]; then
+        echo "Non-TTY output should not include ANSI color codes" >&2
+        return 1
+    fi
+}
+
 # Run all tests
 run_unit_test "log_info_output" test_log_info_output
 run_unit_test "log_warn_output" test_log_warn_output
@@ -108,3 +165,9 @@ run_unit_test "log_debug_verbose_mode" test_log_debug_verbose_mode
 run_unit_test "no_color_mode" test_no_color_mode
 run_unit_test "log_empty_message" test_log_empty_message
 run_unit_test "log_special_characters" test_log_special_characters
+run_unit_test "log_info_stderr_only" test_log_info_stderr_only
+run_unit_test "log_warn_stderr_only" test_log_warn_stderr_only
+run_unit_test "log_error_stderr_only" test_log_error_stderr_only
+run_unit_test "log_success_stderr_only" test_log_success_stderr_only
+run_unit_test "log_step_stderr_only" test_log_step_stderr_only
+run_unit_test "no_color_non_tty" test_no_color_non_tty

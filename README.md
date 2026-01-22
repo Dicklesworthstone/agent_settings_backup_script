@@ -71,6 +71,13 @@ cd agent_settings_backup_script
 cp asb ~/.local/bin/
 ```
 
+**Verify installation:**
+
+```bash
+asb version   # Should output: asb version 0.3.0
+asb help      # Shows available commands
+```
+
 ### Shell Completion
 
 Enable tab completion for commands and agent names:
@@ -521,6 +528,32 @@ asb --dry-run restore claude
 - `git` (required)
 - `rsync` (recommended, falls back to `cp`)
 - `curl` or `wget` (for installation)
+
+## FAQ
+
+**Q: Can I backup agents that aren't in the default list?**
+A: Yes! Use `asb discover` to scan for and add new agents, or manually add them to `~/.config/asb/custom_agents` in `key=folder` format.
+
+**Q: Where are my backups stored?**
+A: By default in `~/.agent_settings_backups/`. Each agent has its own subdirectory with full git history. Override with `ASB_BACKUP_ROOT` environment variable.
+
+**Q: How do I restore to a specific point in time?**
+A: Run `asb history <agent>` to see commits, then `asb restore <agent> <commit>` or use named tags: `asb tag <agent> <name>` then `asb restore <agent> <name>`.
+
+**Q: Is rsync required?**
+A: No. asb falls back to `cp` if rsync isn't available, though rsync provides more efficient incremental syncing.
+
+**Q: How do I transfer backups between machines?**
+A: Use `asb export <agent> backup.tar.gz` on the source machine, copy the file, then `asb import backup.tar.gz` on the destination.
+
+**Q: What files are excluded from backups?**
+A: Log files (`*.log`), cache directories (`cache/`, `Cache/`, `.cache/`), and SQLite temp files (`*.sqlite3-wal`, `*.sqlite3-shm`) are excluded by default.
+
+**Q: Can I run backups automatically?**
+A: Yes! Use `asb schedule --systemd --interval daily` for systemd timers or `asb schedule --cron --interval weekly` for cron jobs.
+
+**Q: How do I verify my backups are working?**
+A: Run `asb verify <agent>` to check backup integrity, or `asb verify` to check all agents.
 
 ## License
 
