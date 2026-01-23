@@ -38,6 +38,7 @@
 #==============================================================================
 
 set -uo pipefail
+export LC_ALL=C
 
 #==============================================================================
 # VERSION
@@ -201,15 +202,22 @@ get_hooks_root() {
 }
 
 get_asb_command_path() {
-    local cmd_path=""
-    if cmd_path=$(command -v asb 2>/dev/null); then
-        echo "$cmd_path"
+    # Prefer the currently executing script path
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        local script_path
+        if command -v readlink >/dev/null 2>&1; then
+            script_path=$(readlink -f "${BASH_SOURCE[0]}")
+        else
+            local script_dir
+            script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+            script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+        fi
+        echo "$script_path"
         return 0
     fi
-    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-        local script_dir
-        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-        echo "${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    # Fallback to PATH lookup
+    if command -v asb >/dev/null 2>&1; then
+        command -v asb
         return 0
     fi
     echo "asb"
