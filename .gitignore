@@ -15,6 +15,7 @@ Thumbs.db
 # Test artifacts
 test_output/
 coverage/
+test\ space/
 
 # Build artifacts
 a.out
