@@ -36,8 +36,12 @@ done
 
 export LOG_LEVEL
 export KEEP_TEST_ARTIFACTS
-export TMPDIR="${TMPDIR:-/data/tmp}"
-mkdir -p "$TMPDIR"
+if [[ -n "${TMPDIR:-}" ]] && [[ -d "${TMPDIR}" ]]; then
+    : # Use existing TMPDIR
+else
+    export TMPDIR="${TMPDIR:-/tmp}"
+    mkdir -p "$TMPDIR" 2>/dev/null || export TMPDIR="/tmp"
+fi
 
 source "${SCRIPT_DIR}/lib/logging.sh"
 
@@ -73,7 +77,7 @@ skipped=0
 
 if [[ "$PARALLEL" -gt 1 ]]; then
     log_info "Running tests in parallel (jobs=${PARALLEL})"
-    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t asb-test-run)
+    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t asb-test-run.XXXXXXXX)
     idx=0
     status_files=()
 

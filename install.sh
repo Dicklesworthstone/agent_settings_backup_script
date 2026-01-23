@@ -63,7 +63,7 @@ command_exists() {
 }
 
 mktemp_dir() {
-    mktemp -d 2>/dev/null || mktemp -d -t asb 2>/dev/null
+    mktemp -d 2>/dev/null || mktemp -d -t asb.XXXXXXXX 2>/dev/null
 }
 
 get_shell_config() {

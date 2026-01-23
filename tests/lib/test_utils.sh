@@ -29,9 +29,13 @@ skip_if_missing() {
 }
 
 setup_test_env() {
-    export TMPDIR="${TMPDIR:-/data/tmp}"
-    mkdir -p "$TMPDIR"
-    TEST_ENV_ROOT=$(mktemp -d 2>/dev/null || mktemp -d -t asb-test)
+    if [[ -n "${TMPDIR:-}" ]] && [[ -d "${TMPDIR}" ]]; then
+        : # Use existing TMPDIR
+    else
+        export TMPDIR="${TMPDIR:-/tmp}"
+        mkdir -p "$TMPDIR" 2>/dev/null || export TMPDIR="/tmp"
+    fi
+    TEST_ENV_ROOT=$(mktemp -d 2>/dev/null || mktemp -d -t asb-test.XXXXXXXX)
     export HOME="${TEST_ENV_ROOT}/home"
     export XDG_CONFIG_HOME="${TEST_ENV_ROOT}/xdg"
     export ASB_BACKUP_ROOT="${TEST_ENV_ROOT}/backups"
@@ -70,8 +74,8 @@ preserve_artifacts() {
         return 0
     fi
 
-    local dest_root="${TEST_ARTIFACTS_ROOT:-/data/tmp/asb-test-artifacts}"
-    mkdir -p "$dest_root"
+    local dest_root="${TEST_ARTIFACTS_ROOT:-${TMPDIR:-/tmp}/asb-test-artifacts}"
+    mkdir -p "$dest_root" 2>/dev/null || return 0
     local dest="${dest_root}/${test_name}-$(date +%Y%m%d-%H%M%S)"
     cp -r "$TEST_ENV_ROOT" "$dest" 2>/dev/null || true
     log_info "Artifacts preserved at ${dest}"
