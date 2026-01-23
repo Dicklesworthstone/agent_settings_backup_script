@@ -147,7 +147,7 @@ log_success() { printf '%b\n' "${GREEN}✓${RESET} $*" >&2; }
 log_warn() { printf '%b\n' "${YELLOW}⚠${RESET} $*" >&2; }
 log_error() { printf '%b\n' "${RED}✗${RESET} $*" >&2; }
 log_step() { printf '%b\n' "${CYAN}→${RESET} $*" >&2; }
-log_debug() { is_truthy "${ASB_VERBOSE:-false}" && printf '%b\n' "${DIM}  $*${RESET}" >&2 || true; }
+log_debug() { if is_truthy "${ASB_VERBOSE:-false}"; then printf '%b\n' "${DIM}  $*${RESET}" >&2; fi; }
 log_dry() { printf '%b\n' "${YELLOW}!${RESET} DRY RUN: $*" >&2; }
 
 #==============================================================================
@@ -776,7 +776,7 @@ show_restore_preview() {
         2>/dev/null || true)
 
     if [[ -z "$diff_output" ]]; then
-        printf "  ${DIM}(no differences detected)${RESET}\n" >&2
+        printf '  %s(no differences detected)%s\n' "$DIM" "$RESET" >&2
         return 0
     fi
 
@@ -790,7 +790,7 @@ show_restore_preview() {
             local rest="${line#Only in }"
             local dir="${rest%%:*}"
             local file="${rest#*: }"
-            local rel_dir="${dir#$current_dir/}"
+            local rel_dir="${dir#"$current_dir"/}"
             local rel_path
             if [[ "$dir" == "$current_dir" ]]; then
                 rel_path="$file"
@@ -803,7 +803,7 @@ show_restore_preview() {
             local rest="${line#Only in }"
             local dir="${rest%%:*}"
             local file="${rest#*: }"
-            local rel_dir="${dir#$temp_backup/}"
+            local rel_dir="${dir#"$temp_backup"/}"
             local rel_path
             if [[ "$dir" == "$temp_backup" ]]; then
                 rel_path="$file"
@@ -813,7 +813,7 @@ show_restore_preview() {
             entries+=("${rel_path}|add")
             ((only_in_backup++))
         elif [[ "$line" == "Files "* && "$line" == *" differ" ]]; then
-            local file="${line#Files $current_dir/}"
+            local file="${line#Files "$current_dir"/}"
             file="${file%% and *}"
             entries+=("${file}|replace")
             ((differs++))
@@ -2024,13 +2024,13 @@ show_diff() {
             [[ -z "$line" ]] && continue
             if [[ "$line" == "Only in $dest"* ]]; then
                 # File only in backup (will be added on restore / was deleted)
-                local file="${line#Only in $dest}"
+                local file="${line#Only in "$dest"}"
                 file="${file#/: }"
                 file="${file#: }"
                 removed+=("\"$(json_escape_string "$file")\"")
             elif [[ "$line" == "Only in $temp_dir"* ]]; then
                 # File only in current (new file)
-                local file="${line#Only in $temp_dir}"
+                local file="${line#Only in "$temp_dir"}"
                 file="${file#/: }"
                 file="${file#: }"
                 added+=("\"$(json_escape_string "$file")\"")
@@ -2038,7 +2038,7 @@ show_diff() {
                 # File differs
                 local file="${line#Files }"
                 file="${file%% and *}"
-                file="${file#$dest/}"
+                file="${file#"$dest"/}"
                 modified+=("\"$(json_escape_string "$file")\"")
             fi
         done <<< "$diff_output"
