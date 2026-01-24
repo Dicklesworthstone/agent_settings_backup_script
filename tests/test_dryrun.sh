@@ -42,7 +42,13 @@ test_dryrun_backup_no_git_commits() {
 
 test_dryrun_backup_shows_preview() {
     create_claude_fixture
+    # Debug: show test environment
+    echo "DEBUG: HOME=$HOME" >&2
+    echo "DEBUG: Fixture exists: $(ls -la "${HOME}/.claude" 2>&1 | head -3)" >&2
     run_asb --dry-run backup claude
+    echo "DEBUG: Exit status: $ASB_LAST_STATUS" >&2
+    echo "DEBUG: Output length: ${#ASB_LAST_OUTPUT}" >&2
+    echo "DEBUG: Output (first 500 chars): ${ASB_LAST_OUTPUT:0:500}" >&2
     assert_exit_code 0 "$ASB_LAST_STATUS"
     assert_contains "$ASB_LAST_OUTPUT" "DRY RUN"
     assert_contains "$ASB_LAST_OUTPUT" "Would backup"
