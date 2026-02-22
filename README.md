@@ -8,7 +8,7 @@
 
 [![Test](https://github.com/Dicklesworthstone/agent_settings_backup_script/actions/workflows/test.yml/badge.svg)](https://github.com/Dicklesworthstone/agent_settings_backup_script/actions/workflows/test.yml)
 [![Release](https://github.com/Dicklesworthstone/agent_settings_backup_script/actions/workflows/release.yml/badge.svg)](https://github.com/Dicklesworthstone/agent_settings_backup_script/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 
 </div>
 
@@ -604,7 +604,7 @@ A: Run `asb verify <agent>` to check backup integrity, or `asb verify` to check 
 
 ## License
 
-MIT
+MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE).
 
 ## Related Projects
 
