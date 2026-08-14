@@ -84,7 +84,7 @@ Enable tab completion for commands and agent names:
 # Bash (~/.bashrc)
 eval "$(asb completion bash)"
 
-# Zsh (~/.zshrc)
+# Zsh (~/.zshrc — place after compinit is loaded)
 eval "$(asb completion zsh)"
 
 # Fish (~/.config/fish/config.fish)

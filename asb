@@ -3632,7 +3632,16 @@ _asb() {
     esac
 }
 
-_asb "$@"
+# When autoloaded from fpath, zsh runs this file as the _asb completion
+# function itself, so invoke it. When eval'd/sourced from an rc file, just
+# register the function with compdef instead (calling _asb directly outside
+# a completion context errors with "can only be called from completion
+# function").
+if [ "${funcstack[1]}" = "_asb" ]; then
+    _asb "$@"
+elif (( ${+functions[compdef]} )); then
+    compdef _asb asb
+fi
 ZSHCOMP
 }
 
@@ -3841,7 +3850,7 @@ ${BOLD}SHELL COMPLETION${RESET}
     Bash (~/.bashrc):
         eval "\$(asb completion bash)"
 
-    Zsh (~/.zshrc):
+    Zsh (~/.zshrc, after compinit is loaded):
         eval "\$(asb completion zsh)"
 
     Fish (~/.config/fish/config.fish):
