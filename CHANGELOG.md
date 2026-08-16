@@ -6,7 +6,22 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ---
 
-## [v0.3.0] — 2026-01-21 (current, untagged)
+## [v0.3.1] — 2026-08-15
+
+First tagged GitHub Release (assets: `asb`, `checksums.txt`), cut so the installer's primary `releases/latest/download` path resolves instead of always falling back to raw `main`.
+
+### Fixed
+
+- **`eval "$(asb completion zsh)"` no longer errors** — the zsh completion script tail is now guarded so eval-based installs work ([`6a5bc94`](https://github.com/Dicklesworthstone/agent_settings_backup_script/commit/6a5bc941f70b86e6a2e4f6f127e615302b088f47))
+- **Installer quiets the missing-release fallback** — falling back to raw `main` when no GitHub Release exists is no longer noisy ([`9a5a4b1`](https://github.com/Dicklesworthstone/agent_settings_backup_script/commit/9a5a4b18a6998bdd554b747658eee20edff06f16))
+
+### Changed
+
+- CI status badges removed from README (GH Actions throttling made them misleading) ([`c6e8a7a`](https://github.com/Dicklesworthstone/agent_settings_backup_script/commit/c6e8a7ac2c8f42746c6c66be05f9f26ec80af894))
+
+---
+
+## [v0.3.0] — 2026-01-21 (untagged)
 
 VERSION bumped in commit [`2091367`](https://github.com/Dicklesworthstone/agent_settings_backup_script/commit/20913676a9718a538f7a87d9cce10f5bb68365ab). Development spans 2026-01-21 through 2026-03-13 (HEAD [`1ad6405`](https://github.com/Dicklesworthstone/agent_settings_backup_script/commit/1ad6405acaf4f3a2592576c9c456395fe6ffaf7e)).
 
