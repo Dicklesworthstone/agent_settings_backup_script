@@ -505,6 +505,47 @@ create_backup_commit() {
 # BACKUP OPERATIONS
 #==============================================================================
 
+# Shared rsync exclusions for backup AND restore.
+#
+# ASB backs up agent SETTINGS. Session transcripts and per-file edit history
+# are data, not settings — on real machines they reach 50GB+ (~/.codex/sessions,
+# ~/.claude/file-history, ~/.claude/projects), which makes backups enormous,
+# slow (multi-hour git adds), and secrets-adjacent.
+#
+# The same list is applied on restore so that `rsync --delete` never removes
+# live session data that is (by design) absent from the backup.
+ASB_RSYNC_EXCLUDES=(
+    --exclude='.git'
+    --exclude='.gitignore'
+    --exclude='*.log'
+    --exclude='cache/'
+    --exclude='Cache/'
+    --exclude='.cache/'
+    --exclude='*.sqlite3-wal'
+    --exclude='*.sqlite3-shm'
+    --exclude='sessions/'
+    --exclude='archived_sessions/'
+    --exclude='file-history/'
+    --exclude='projects/'
+    --exclude='downloads/'
+    --exclude='shell-snapshots/'
+)
+
+# Top-level directory names the cp fallbacks must never copy into a backup
+# nor delete from a live config dir (mirrors ASB_RSYNC_EXCLUDES).
+ASB_EXCLUDED_NAMES=(
+    sessions archived_sessions file-history projects downloads
+    shell-snapshots cache Cache .cache
+)
+
+asb_is_excluded_name() {
+    local name="$1" candidate
+    for candidate in "${ASB_EXCLUDED_NAMES[@]}"; do
+        [[ "$name" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
 backup_agent() {
     local agent="$1"
     local source
@@ -533,14 +574,7 @@ backup_agent() {
                 if [[ -d "$dest" ]]; then
                     local changes
                     changes=$(rsync -a --delete --checksum --dry-run --itemize-changes \
-                        --exclude='.git' \
-                        --exclude='.gitignore' \
-                        --exclude='*.log' \
-                        --exclude='cache/' \
-                        --exclude='Cache/' \
-                        --exclude='.cache/' \
-                        --exclude='*.sqlite3-wal' \
-                        --exclude='*.sqlite3-shm' \
+                        "${ASB_RSYNC_EXCLUDES[@]}" \
                         "$source/" "$dest/" 2>/dev/null | head -30)
 
                     if [[ -n "$changes" ]]; then
@@ -591,14 +625,7 @@ backup_agent() {
     local needs_fallback=false
     if command_exists rsync; then
         if ! rsync -a --delete --checksum \
-            --exclude='.git' \
-            --exclude='.gitignore' \
-            --exclude='*.log' \
-            --exclude='cache/' \
-            --exclude='Cache/' \
-            --exclude='.cache/' \
-            --exclude='*.sqlite3-wal' \
-            --exclude='*.sqlite3-shm' \
+            "${ASB_RSYNC_EXCLUDES[@]}" \
             "$source/" "$dest/" 2>/dev/null; then
             if ! is_json_output; then
                 log_warn "rsync failed; falling back to cp"
@@ -619,8 +646,17 @@ backup_agent() {
         if [[ -d "$dest/.git" ]]; then
             mv "$dest/.git" "$dest/.git.asb_preserve" 2>/dev/null && git_preserved=true
         fi
-        # Copy all files from source (use /. to include hidden files)
-        cp -r "$source"/. "$dest/" 2>/dev/null || true
+        # Copy top-level entries individually so excluded data dirs
+        # (sessions, file-history, ...) stay out of the backup, matching
+        # the rsync exclusion policy.
+        local _entry _name
+        for _entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+            [[ -e "$_entry" || -L "$_entry" ]] || continue
+            _name="$(basename "$_entry")"
+            [[ "$_name" == ".git" || "$_name" == ".gitignore" ]] && continue
+            asb_is_excluded_name "$_name" && continue
+            cp -r "$_entry" "$dest/" 2>/dev/null || true
+        done
         # Remove any .git that came from source
         rm -rf "$dest/.git" 2>/dev/null || true
         # Restore backup's preserved .git
@@ -1060,9 +1096,11 @@ restore_agent() {
     # Sync files
     local needs_fallback=false
     if command_exists rsync; then
+        # Same exclusions as backup: excluded paths are both absent from the
+        # backup and protected from --delete on the live side, so a restore
+        # can never wipe live session data, caches, or edit history.
         if ! rsync -a --delete --checksum \
-            --exclude='.git' \
-            --exclude='.gitignore' \
+            "${ASB_RSYNC_EXCLUDES[@]}" \
             "$source/" "$dest/" 2>/dev/null; then
             if ! is_json_output; then
                 log_warn "rsync failed; falling back to cp"
@@ -1075,8 +1113,16 @@ restore_agent() {
     fi
 
     if [[ "$needs_fallback" == "true" ]]; then
-        # Remove existing files (but preserve structure for hidden files)
-        find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} \; 2>/dev/null
+        # Remove existing files, but NEVER live data dirs that are excluded
+        # from backups (sessions, file-history, ...): the backup does not
+        # contain them, so deleting them here would destroy live data.
+        local _entry _name
+        for _entry in "$dest"/* "$dest"/.[!.]* "$dest"/..?*; do
+            [[ -e "$_entry" || -L "$_entry" ]] || continue
+            _name="$(basename "$_entry")"
+            asb_is_excluded_name "$_name" && continue
+            rm -rf "$_entry" 2>/dev/null
+        done
         # Copy all files including hidden ones (use /. to include dotfiles)
         cp -r "$source"/. "$dest/" 2>/dev/null || true
         # Remove .git and .gitignore that came from backup (shouldn't be in destination)
