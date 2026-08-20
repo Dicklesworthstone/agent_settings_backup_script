@@ -538,6 +538,27 @@ ASB_EXCLUDED_NAMES=(
     shell-snapshots cache Cache .cache
 )
 
+# The same policy for `diff -rq` previews and change detection (diff matches
+# basenames, so no trailing slashes). Without this, previews would list live
+# session data as "will be DELETED" (restore never touches it) and excluded-
+# only differences would trigger no-op restores.
+ASB_DIFF_EXCLUDES=(
+    --exclude='.git'
+    --exclude='.gitignore'
+    --exclude='*.log'
+    --exclude='cache'
+    --exclude='Cache'
+    --exclude='.cache'
+    --exclude='*.sqlite3-wal'
+    --exclude='*.sqlite3-shm'
+    --exclude='sessions'
+    --exclude='archived_sessions'
+    --exclude='file-history'
+    --exclude='projects'
+    --exclude='downloads'
+    --exclude='shell-snapshots'
+)
+
 asb_is_excluded_name() {
     local name="$1" candidate
     for candidate in "${ASB_EXCLUDED_NAMES[@]}"; do
@@ -842,8 +863,7 @@ show_restore_preview() {
     # Get diff output
     local diff_output
     diff_output=$(diff -rq "$current_dir" "$temp_backup" \
-        --exclude='.git' \
-        --exclude='.gitignore' \
+        "${ASB_DIFF_EXCLUDES[@]}" \
         2>/dev/null || true)
 
     if [[ -z "$diff_output" ]]; then
@@ -1011,8 +1031,7 @@ restore_agent() {
             if [[ -d "$dest" ]]; then
                 local diff_output
                 diff_output=$(diff -rq "$dest" "$temp_backup" \
-                    --exclude='.git' --exclude='.gitignore' \
-                    --exclude='*.log' --exclude='cache' --exclude='Cache' --exclude='.cache' 2>/dev/null || true)
+                    "${ASB_DIFF_EXCLUDES[@]}" 2>/dev/null || true)
                 if [[ -n "$diff_output" ]]; then
                     RESTORE_HAS_CHANGES=true
                 else
@@ -2088,12 +2107,7 @@ show_diff() {
     # Compare with backup
     local diff_output
     diff_output=$(diff -rq "$dest" "$temp_dir" \
-        --exclude='.git' \
-        --exclude='.gitignore' \
-        --exclude='*.log' \
-        --exclude='cache' \
-        --exclude='Cache' \
-        --exclude='.cache' \
+        "${ASB_DIFF_EXCLUDES[@]}" \
         2>/dev/null || true)
 
     if is_json_output; then
