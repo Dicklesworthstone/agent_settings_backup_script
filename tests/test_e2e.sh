@@ -692,6 +692,132 @@ test_verify_workflow() {
 # Main test runner
 # ============================================
 
+test_public_installer_workflow() {
+    local tag="${ASB_INSTALL_E2E_VERSION:-}"
+    tag="v${tag#v}"
+    local expected="${ASB_INSTALL_E2E_SHA256:-}"
+    if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]] ||
+       [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        log_error "Fresh public release version and asset SHA256 are required"
+        return 1
+    fi
+    command_exists curl || { log_error "Actual curl is required"; return 1; }
+    command_exists python3 || { log_error "Independent Python SHA256 verification is required"; return 1; }
+
+    local installer="${REPO_ROOT}/install.sh"
+    local pinned_dir="${TEST_ENV_ROOT}/pinned-install"
+    local latest_dir="${TEST_ENV_ROOT}/latest-install"
+    local missing_dir="${TEST_ENV_ROOT}/missing-install"
+    local manifest="${TEST_ENV_ROOT}/asb-checksums.txt"
+    local output status mode
+    output=$(DEST="$pinned_dir" ASB_VERSION="$tag" ASB_UNSAFE_MAIN=0 bash < "$installer" 2>&1) || {
+        log_error "$output"; return 1;
+    }
+    assert_file_exists "$pinned_dir/asb" || return 1
+    python3 -c 'import hashlib,sys; assert hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == sys.argv[2]' "$pinned_dir/asb" "$expected" || return 1
+    mode=$(stat -c%a "$pinned_dir/asb" 2>/dev/null || stat -f%Lp "$pinned_dir/asb") || return 1
+    assert_equals "755" "$mode" || return 1
+    output=$("$pinned_dir/asb" version) || return 1
+    assert_equals "asb version ${tag#v}" "$output" || return 1
+
+    output=$(DEST="$latest_dir" ASB_VERSION= ASB_UNSAFE_MAIN=0 bash < "$installer" 2>&1) || {
+        log_error "$output"; return 1;
+    }
+    assert_contains "$output" "Downloading asb ($tag)" || return 1
+    cmp "$pinned_dir/asb" "$latest_dir/asb" || return 1
+
+    if output=$(DEST="$missing_dir" ASB_VERSION="0.0.0-no-release-$(date +%s)-$$" ASB_UNSAFE_MAIN=0 bash < "$installer" 2>&1); then
+        log_error "A missing public release unexpectedly installed successfully"
+        return 1
+    fi
+    assert_contains "$output" "404" || return 1
+    assert_contains "$output" "Failed to download release" || return 1
+    assert_dir_not_exists "$missing_dir" || return 1
+
+    curl -fsSL -A 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+        "https://github.com/Dicklesworthstone/agent_settings_backup_script/releases/download/$tag/asb-checksums.txt" \
+        -o "$manifest" || return 1
+    ( source "$installer"; verify_release_checksum "$pinned_dir/asb" "$manifest" ) || return 1
+
+    local corrupt="${TEST_ENV_ROOT}/corrupt-asb"
+    local duplicate="${TEST_ENV_ROOT}/duplicate-checksums.txt"
+    local malformed="${TEST_ENV_ROOT}/malformed-checksums.txt"
+    local empty="${TEST_ENV_ROOT}/empty-checksums.txt"
+    cp "$pinned_dir/asb" "$corrupt" || return 1
+    printf '\n' >> "$corrupt" || return 1
+    cat "$manifest" "$manifest" > "$duplicate" || return 1
+    printf '%s  asb\n' "${expected:1}" > "$malformed" || return 1
+    : > "$empty" || return 1
+    if ( source "$installer"; verify_release_checksum "$corrupt" "$manifest" ); then
+        log_error "Changed public asset bytes passed verification"; return 1
+    fi
+    local invalid_manifest
+    for invalid_manifest in "$duplicate" "$malformed" "$empty"; do
+        if ( source "$installer"; verify_release_checksum "$pinned_dir/asb" "$invalid_manifest" ); then
+            log_error "Invalid checksum metadata passed verification: $invalid_manifest"
+            return 1
+        fi
+    done
+
+    local directory_dest="${TEST_ENV_ROOT}/directory-destination"
+    local symlink_dest="${TEST_ENV_ROOT}/symlink-destination"
+    local link_target="${TEST_ENV_ROOT}/retained-link-target.txt"
+    mkdir -p "$directory_dest/asb" "$symlink_dest" || return 1
+    printf 'keep-directory-entry\n' > "$directory_dest/asb/incumbent.txt" || return 1
+    printf 'keep-link-target\n' > "$link_target" || return 1
+    ln -s "$link_target" "$symlink_dest/asb" || return 1
+    local invalid_destination
+    for invalid_destination in "$directory_dest" "$symlink_dest"; do
+        if output=$(
+            exec 2>&1
+            source "$installer" || exit 1
+            install_script "$pinned_dir/asb" "$invalid_destination"
+        ); then
+            log_error "A non-regular destination was accepted: $invalid_destination"
+            return 1
+        fi
+        assert_contains "$output" "Refusing to replace a non-regular or symlink destination" || return 1
+    done
+    assert_equals "keep-directory-entry" "$(cat "$directory_dest/asb/incumbent.txt")" || return 1
+    assert_file_not_exists "$directory_dest/asb/asb" || return 1
+    [[ -L "$symlink_dest/asb" ]] || return 1
+    assert_equals "$link_target" "$(readlink "$symlink_dest/asb")" || return 1
+    assert_equals "keep-link-target" "$(cat "$link_target")" || return 1
+
+    local failed_dir="${TEST_ENV_ROOT}/kernel-copy-failure"
+    if output=$(
+        exec 2>&1
+        ulimit -f 0 || exit 125
+        trap '' XFSZ || exit 125
+        source "$installer"
+        install_script "$pinned_dir/asb" "$failed_dir"
+    ); then
+        status=0
+    else
+        status=$?
+    fi
+    if [[ $status -eq 125 ]]; then
+        log_error "Kernel file-size failure could not be established"; return 1
+    fi
+    if [[ $status -eq 0 ]]; then
+        log_error "Actual copy failure reported installation success"; return 1
+    fi
+    assert_contains "$output" "Failed to install asb" || return 1
+    assert_file_exists "$failed_dir/asb" || return 1
+    [[ ! -s "$failed_dir/asb" ]] || return 1
+    python3 -c 'import hashlib,sys; assert hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == sys.argv[2]' "$pinned_dir/asb" "$expected" || return 1
+}
+
+# Select the actual installer workflow explicitly; absence is not qualification.
+# Its artifacts are retained, and unrelated destructive legacy workflows stay unrun.
+if [[ "${ASB_INSTALL_E2E:-0}" == "1" ]]; then
+    KEEP_TEST_ARTIFACTS=true
+    e2e_start
+    run_e2e_test "public_installer_workflow" test_public_installer_workflow || exit 1
+    e2e_summary
+    exit 0
+fi
+
 e2e_start
 
 run_e2e_test "first_backup_workflow" test_first_backup_workflow || true
