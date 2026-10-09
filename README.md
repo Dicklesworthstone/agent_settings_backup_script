@@ -570,9 +570,12 @@ asb --dry-run restore claude
 
 ## Requirements
 
+- Bash 4 or later on `PATH` (required)
 - `git` (required)
 - `rsync` (recommended, falls back to `cp`)
 - `curl` or `wget` (for installation)
+- `sha256sum` or `shasum` (for release verification during installation)
+- Perl with its core `Fcntl`, `File::Temp`, `File::Copy`, and `Digest::SHA` modules (for kernel locking and atomic installer publication)
 
 ## FAQ
 

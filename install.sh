@@ -292,18 +292,100 @@ install_script() {
         fi
     fi
 
-    # Install with proper permissions
+    install_dir=$(cd -- "$install_dir" && pwd -P) || return 1
+    dest="$install_dir/$SCRIPT_NAME"
+    local perl_bin publisher
+    perl_bin=$(type -P perl) || {
+        log_error "Perl is required for locked, atomic installer publication"
+        return 1
+    }
+
+    # Keep the kernel lock in the publishing process, including across failures.
+    # All prepared and incumbent files are retained; only a complete candidate
+    # is renamed onto the exact destination (never copied into a directory).
+    publisher=$(cat <<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(:DEFAULT :flock S_ISREG O_NOFOLLOW);
+use File::Temp qw(tempfile);
+use File::Copy qw(copy);
+use Digest::SHA;
+
+my ($source, $directory, $name) = @ARGV;
+my $destination = "$directory/$name";
+my $lock_path = "$directory/.$name-install.lock";
+sysopen(my $lock, $lock_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600)
+    or die "Cannot open installer lock $lock_path: $!\n";
+my @lock_stat = stat($lock);
+@lock_stat && S_ISREG($lock_stat[2]) or die "Installer lock is not a regular file\n";
+flock($lock, LOCK_EX | LOCK_NB)
+    or die "Another installation holds $lock_path: $!\n";
+my @lock_path_stat = lstat($lock_path);
+@lock_path_stat && $lock_stat[0] == $lock_path_stat[0] && $lock_stat[1] == $lock_path_stat[1]
+    or die "Installer lock path changed\n";
+
+sub digest {
+    my ($path) = @_;
+    sysopen(my $file, $path, O_RDONLY | O_NOFOLLOW) or die "Cannot read $path: $!\n";
+    binmode($file) or die "Cannot read raw bytes from $path: $!\n";
+    my $sha = Digest::SHA->new(256)->addfile($file)->hexdigest;
+    close($file) or die "Cannot close $path: $!\n";
+    return $sha;
+}
+
+my @incumbent = lstat($destination);
+if (@incumbent && !S_ISREG($incumbent[2])) {
+    die "Refusing to replace a non-regular or symlink destination: $destination\n";
+}
+sysopen(my $input, $source, O_RDONLY | O_NOFOLLOW) or die "Cannot read source $source: $!\n";
+binmode($input) or die "Cannot read raw installer source: $!\n";
+my @input_stat = stat($input);
+@input_stat && S_ISREG($input_stat[2]) or die "Installer source is not a regular file\n";
+my ($candidate_file, $candidate) = tempfile(".$name-install.XXXXXX", DIR => $directory, UNLINK => 0);
+binmode($candidate_file) or die "Cannot prepare raw installer bytes: $!\n";
+print STDERR "Retaining prepared installer file: $candidate\n";
+copy($input, $candidate_file) or die "Cannot prepare installer file $candidate: $!\n";
+close($input) or die "Cannot close installer source: $!\n";
+close($candidate_file) or die "Cannot finish installer file $candidate: $!\n";
+chmod(0755, $candidate) == 1 or die "Cannot set installer permissions: $!\n";
+digest($candidate) eq digest($source) or die "Prepared installer bytes differ from source\n";
+
+if (@incumbent) {
+    sysopen(my $previous, $destination, O_RDONLY | O_NOFOLLOW)
+        or die "Cannot read incumbent $destination: $!\n";
+    binmode($previous) or die "Cannot read raw incumbent bytes: $!\n";
+    my @opened = stat($previous);
+    @opened && $opened[0] == $incumbent[0] && $opened[1] == $incumbent[1]
+        or die "Incumbent changed before preservation\n";
+    my ($backup_file, $backup) = tempfile(".$name-previous.XXXXXX", DIR => $directory, UNLINK => 0);
+    binmode($backup_file) or die "Cannot preserve raw incumbent bytes: $!\n";
+    print STDERR "Retaining incumbent backup: $backup\n";
+    copy($previous, $backup_file) or die "Cannot preserve incumbent $backup: $!\n";
+    close($previous) or die "Cannot close incumbent: $!\n";
+    close($backup_file) or die "Cannot finish incumbent backup: $!\n";
+    chmod($incumbent[2] & 0777, $backup) == 1 or die "Cannot preserve incumbent permissions: $!\n";
+    digest($backup) eq digest($destination) or die "Incumbent changed during preservation\n";
+}
+my @current = lstat($destination);
+if (@incumbent) {
+    @current && S_ISREG($current[2]) && $current[0] == $incumbent[0] && $current[1] == $incumbent[1]
+        or die "Incumbent path changed before publication\n";
+} else {
+    !@current or die "Destination appeared before publication\n";
+}
+rename($candidate, $destination) or die "Cannot publish prepared installer: $!\n";
+PERL
+    ) || return 1
+
     log_step "Installing to $dest"
     if [[ "$install_dir" == "/usr/local/bin" ]]; then
-        if ! sudo cp "$source" "$dest" || ! sudo chmod 0755 "$dest"; then
-            log_error "Failed to install asb to $dest"
+        if ! sudo "$perl_bin" -e "$publisher" "$source" "$install_dir" "$SCRIPT_NAME"; then
+            log_error "Failed to install asb to $dest; prepared files and incumbent retained"
             return 1
         fi
-    else
-        if ! cp "$source" "$dest" || ! chmod 0755 "$dest"; then
-            log_error "Failed to install asb to $dest"
-            return 1
-        fi
+    elif ! "$perl_bin" -e "$publisher" "$source" "$install_dir" "$SCRIPT_NAME"; then
+        log_error "Failed to install asb to $dest; prepared files and incumbent retained"
+        return 1
     fi
 
     log_success "Installed asb to $dest"
@@ -363,6 +445,11 @@ main() {
 
     if ! command_exists git; then
         log_error "git is required for asb to function"
+        exit 1
+    fi
+
+    if ! type -P perl >/dev/null; then
+        log_error "Perl is required for locked, atomic installer publication"
         exit 1
     fi
 

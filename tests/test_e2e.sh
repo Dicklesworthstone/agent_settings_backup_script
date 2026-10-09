@@ -784,27 +784,106 @@ test_public_installer_workflow() {
     assert_equals "$link_target" "$(readlink "$symlink_dest/asb")" || return 1
     assert_equals "keep-link-target" "$(cat "$link_target")" || return 1
 
+    local upgrade_dir="${TEST_ENV_ROOT}/repeat-install"
+    mkdir -p "$upgrade_dir" || return 1
+    cp -p "$pinned_dir/asb" "$upgrade_dir/asb" || return 1
+    local previous_inode
+    previous_inode=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$upgrade_dir/asb") || return 1
+    ( source "$installer"; install_script "$pinned_dir/asb" "$upgrade_dir" ) || return 1
+    python3 - "$upgrade_dir" "$expected" "$previous_inode" <<'PY' || return 1
+import hashlib, os, pathlib, stat, sys
+directory = pathlib.Path(sys.argv[1])
+current = directory / "asb"
+assert current.stat().st_ino != int(sys.argv[3]), "Publication must replace the prepared inode"
+backups = list(directory.glob(".asb-previous.*"))
+assert len(backups) == 1, "Repeat install must retain exactly one incumbent backup"
+for path in (current, backups[0]):
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == sys.argv[2]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o755
+assert not list(directory.glob(".asb-install.*")), "The complete candidate must be published"
+PY
+    output=$("$upgrade_dir/asb" version) || return 1
+    assert_equals "asb version ${tag#v}" "$output" || return 1
+
+    local contention_dir="${TEST_ENV_ROOT}/kernel-lock-contention"
+    mkdir -p "$contention_dir" || return 1
+    cp -p "$pinned_dir/asb" "$contention_dir/asb" || return 1
+    python3 - "$installer" "$pinned_dir/asb" "$contention_dir" <<'PY' || return 1
+import fcntl, pathlib, subprocess, sys
+directory = pathlib.Path(sys.argv[3])
+incumbent = directory / "asb"
+before = incumbent.read_bytes(), incumbent.stat()
+with (directory / ".asb-install.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; install_script "$2" "$3"',
+         "asb-lock-negative", sys.argv[1], sys.argv[2], sys.argv[3]],
+        capture_output=True, text=True, timeout=30)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    assert result.returncode != 0, "A competing kernel lock must prevent publication"
+    assert "Another installation holds" in result.stderr
+    assert incumbent.read_bytes() == before[0]
+    assert incumbent.stat().st_ino == before[1].st_ino
+    assert incumbent.stat().st_mode == before[1].st_mode
+    assert not list(directory.glob(".asb-install.*"))
+    assert not list(directory.glob(".asb-previous.*"))
+# The real parent lock closes naturally; the same install must now succeed.
+PY
+    ( source "$installer"; install_script "$pinned_dir/asb" "$contention_dir" ) || return 1
+    cmp "$pinned_dir/asb" "$contention_dir/asb" || return 1
+
+    local lock_symlink_dir="${TEST_ENV_ROOT}/symlink-lock"
+    local lock_target="${TEST_ENV_ROOT}/retained-lock-target.txt"
+    mkdir -p "$lock_symlink_dir" || return 1
+    printf 'keep-lock-target\n' > "$lock_target" || return 1
+    ln -s "$lock_target" "$lock_symlink_dir/.asb-install.lock" || return 1
+    if output=$( source "$installer"; install_script "$pinned_dir/asb" "$lock_symlink_dir" 2>&1 ); then
+        log_error "A symlink kernel-lock path was accepted"; return 1
+    fi
+    assert_contains "$output" "Cannot open installer lock" || return 1
+    assert_file_not_exists "$lock_symlink_dir/asb" || return 1
+    assert_equals "keep-lock-target" "$(cat "$lock_target")" || return 1
+    assert_equals "$lock_target" "$(readlink "$lock_symlink_dir/.asb-install.lock")" || return 1
+
     local failed_dir="${TEST_ENV_ROOT}/kernel-copy-failure"
-    if output=$(
-        exec 2>&1
-        ulimit -f 0 || exit 125
-        trap '' XFSZ || exit 125
-        source "$installer"
-        install_script "$pinned_dir/asb" "$failed_dir"
-    ); then
-        status=0
-    else
-        status=$?
-    fi
-    if [[ $status -eq 125 ]]; then
-        log_error "Kernel file-size failure could not be established"; return 1
-    fi
-    if [[ $status -eq 0 ]]; then
-        log_error "Actual copy failure reported installation success"; return 1
-    fi
-    assert_contains "$output" "Failed to install asb" || return 1
-    assert_file_exists "$failed_dir/asb" || return 1
-    [[ ! -s "$failed_dir/asb" ]] || return 1
+    local failed_upgrade_dir="${TEST_ENV_ROOT}/kernel-upgrade-failure"
+    mkdir -p "$failed_upgrade_dir" || return 1
+    cp -p "$pinned_dir/asb" "$failed_upgrade_dir/asb" || return 1
+    previous_inode=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$failed_upgrade_dir/asb") || return 1
+    local failure_destination
+    for failure_destination in "$failed_dir" "$failed_upgrade_dir"; do
+        if output=$(
+            exec 2>&1
+            ulimit -f 0 || exit 125
+            trap '' XFSZ || exit 125
+            source "$installer"
+            install_script "$pinned_dir/asb" "$failure_destination"
+        ); then
+            status=0
+        else
+            status=$?
+        fi
+        if [[ $status -eq 125 ]]; then
+            log_error "Kernel file-size failure could not be established"; return 1
+        fi
+        if [[ $status -eq 0 ]]; then
+            log_error "Actual copy failure reported installation success"; return 1
+        fi
+        assert_contains "$output" "Cannot prepare installer file" || return 1
+        assert_contains "$output" "Failed to install asb" || return 1
+        python3 - "$failure_destination" <<'PY' || return 1
+import pathlib, sys
+candidates = list(pathlib.Path(sys.argv[1]).glob(".asb-install.*"))
+assert len(candidates) == 1, "The failed preparation must retain its actual partial file"
+assert candidates[0].stat().st_size == 0
+PY
+    done
+    assert_file_not_exists "$failed_dir/asb" || return 1
+    cmp "$pinned_dir/asb" "$failed_upgrade_dir/asb" || return 1
+    python3 -c 'import os,sys; assert os.stat(sys.argv[1]).st_ino == int(sys.argv[2])' "$failed_upgrade_dir/asb" "$previous_inode" || return 1
+    mode=$(stat -c%a "$failed_upgrade_dir/asb" 2>/dev/null || stat -f%Lp "$failed_upgrade_dir/asb") || return 1
+    assert_equals "755" "$mode" || return 1
     python3 -c 'import hashlib,sys; assert hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == sys.argv[2]' "$pinned_dir/asb" "$expected" || return 1
 }
 
@@ -814,8 +893,8 @@ test_installer_rejects_old_bash() {
     local old_bash="${ASB_INSTALL_E2E_OLD_BASH:-/bin/bash}"
     local old_major
     if ! old_major=$("$old_bash" -c 'printf "%s" "${BASH_VERSINFO[0]}"') ||
-       [[ ! "$old_major" =~ ^[0-9]+$ ]] || (( old_major >= 4 )); then
-        log_error "An actual admitted Bash older than 4 is required for this negative"
+       [[ ! "$old_major" =~ ^[0-9]+$ ]] || (( old_major != 3 )); then
+        log_error "An actual admitted Bash 3 is required for this negative"
         return 1
     fi
     local old_bin="${TEST_ENV_ROOT}/old-bash-bin"
