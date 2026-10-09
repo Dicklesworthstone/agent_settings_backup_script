@@ -810,6 +810,36 @@ test_public_installer_workflow() {
 
 # Select the actual installer workflow explicitly; absence is not qualification.
 # Its artifacts are retained, and unrelated destructive legacy workflows stay unrun.
+test_installer_rejects_old_bash() {
+    local old_bash="${ASB_INSTALL_E2E_OLD_BASH:-/bin/bash}"
+    local old_major
+    if ! old_major=$("$old_bash" -c 'printf "%s" "${BASH_VERSINFO[0]}"') ||
+       [[ ! "$old_major" =~ ^[0-9]+$ ]] || (( old_major >= 4 )); then
+        log_error "An actual admitted Bash older than 4 is required for this negative"
+        return 1
+    fi
+    local old_bin="${TEST_ENV_ROOT}/old-bash-bin"
+    local destination="${TEST_ENV_ROOT}/unsupported-bash-install"
+    local output
+    mkdir -p "$old_bin" || return 1
+    ln -s "$old_bash" "$old_bin/bash" || return 1
+    if output=$(PATH="$old_bin:$PATH" DEST="$destination" ASB_UNSAFE_MAIN=0 \
+        "$old_bash" < "${REPO_ROOT}/install.sh" 2>&1); then
+        log_error "The installer accepted an unsupported actual Bash runtime"
+        return 1
+    fi
+    assert_contains "$output" "asb requires Bash 4 or later on PATH" || return 1
+    assert_dir_not_exists "$destination" || return 1
+}
+
+if [[ "${ASB_INSTALL_E2E:-0}" == "old-bash" ]]; then
+    KEEP_TEST_ARTIFACTS=true
+    e2e_start
+    run_e2e_test "installer_rejects_old_bash" test_installer_rejects_old_bash || exit 1
+    e2e_summary
+    exit 0
+fi
+
 if [[ "${ASB_INSTALL_E2E:-0}" == "1" ]]; then
     KEEP_TEST_ARTIFACTS=true
     e2e_start
