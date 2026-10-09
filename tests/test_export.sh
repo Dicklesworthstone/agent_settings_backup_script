@@ -76,6 +76,42 @@ test_export_custom_filename() {
     fi
 }
 
+test_export_rejects_partial_archive() {
+    create_claude_fixture || return 1
+    run_asb backup claude || return 1
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+
+    local good_archive="${TEST_ENV_ROOT}/complete-export.tar.gz"
+    run_asb export claude "$good_archive" || return 1
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_archive_contains_git "$good_archive" || return 1
+
+    local partial_archive="${TEST_ENV_ROOT}/partial-export.tar.gz"
+    # The real kernel limit makes real tar leave a file but fail to write it.
+    # Keep the completed positive archive and the failed output for inspection.
+    if ASB_LAST_OUTPUT=$(
+        ulimit -f 0 || exit 125
+        trap '' XFSZ || exit 125
+        "$ASB_BIN" export claude "$partial_archive" 2>&1
+    ); then
+        ASB_LAST_STATUS=0
+    else
+        ASB_LAST_STATUS=$?
+    fi
+
+    if [[ $ASB_LAST_STATUS -eq 125 ]]; then
+        echo "Kernel file-limit case unavailable; no export failure proof" >&2
+        return 1
+    fi
+    assert_file_exists "$partial_archive" || return 1
+    if [[ -s "$partial_archive" || $ASB_LAST_STATUS -eq 0 ]]; then
+        echo "Expected a retained empty archive and a failed export" >&2
+        return 1
+    fi
+    assert_contains "$ASB_LAST_OUTPUT" "Failed to create archive" || return 1
+    assert_archive_contains_git "$good_archive" || return 1
+}
+
 test_export_includes_git() {
     make_backup_with_history
 
@@ -200,6 +236,7 @@ test_export_nonexistent_agent() {
 
 run_test "export_creates_archive" test_export_creates_archive || exit 1
 run_test "export_custom_filename" test_export_custom_filename || exit 1
+run_test "export_rejects_partial_archive" test_export_rejects_partial_archive || exit 1
 run_test "export_includes_git" test_export_includes_git || exit 1
 run_test "export_to_stdout" test_export_to_stdout || exit 1
 run_test "import_restores_backup" test_import_restores_backup || exit 1

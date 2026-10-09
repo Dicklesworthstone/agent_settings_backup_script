@@ -1245,9 +1245,7 @@ export_backup() {
         return 1
     fi
 
-    tar -czf "$output" -C "$backup_root" "$folder" 2>/dev/null
-
-    if [[ ! -f "$output" ]]; then
+    if ! tar -czf "$output" -C "$backup_root" "$folder" || [[ ! -f "$output" ]]; then
         if is_json_output; then
             json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"archive_failed\"}"
         else
