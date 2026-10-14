@@ -6,6 +6,23 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Backups no longer re-commit session databases.** Codex keeps transcripts and logs in `thread_history_N.sqlite` / `logs_N.sqlite`, and Antigravity keeps them in `~/.gemini/antigravity-cli/conversations/` and `brain/`. These are session data, like the `sessions/` directory asb already excludes. A nightly backup was re-committing a 3.9 GB thread database every run, leaving a 40 GB `.git`. They are now excluded, along with `db-backups/` and the `*.sqlite-wal` / `*.sqlite-shm` / `*.db-wal` / `*.db-shm` sidecars (only `*.sqlite3-*` was excluded before).
+- **The cp fallbacks follow the same policy as rsync.** Backup without rsync now drops excluded paths at every depth, not just top-level names. Restore without rsync no longer deletes a top-level folder that holds excluded live data (it merged `antigravity-cli` away, losing conversations newer than the backup).
+
+### Added
+
+- **`asb prune [agents...] [--reinit]`** — removes data the current policy excludes from existing backups (`--dry-run`, `--json`, `--force` supported). `--reinit` also resets the backup's history to one commit and garbage-collects, which is what frees the space.
+
+### Changed
+
+- The exclusion policy is defined once (`ASB_EXCLUDED_DIRS`, `ASB_EXCLUDED_FILE_GLOBS`, `ASB_EXCLUDED_NESTED`); the rsync, diff and cp-fallback rules are derived from it instead of three hand-synced lists.
+
+---
+
 ## [v0.3.1] — 2026-08-15
 
 First tagged GitHub Release (assets: `asb`, `checksums.txt`), cut so the installer's primary `releases/latest/download` path resolves instead of always falling back to raw `main`.

@@ -125,6 +125,7 @@ Commands:
   history <agent>           Show backup history for an agent
   diff <agent>              Show changes since last backup
   verify [agents...]        Verify backup integrity (all if none specified)
+  prune [agents...] [--reinit]  Drop data the backup policy excludes from existing backups
   tag <agent> [name]        Tag a backup (--list, --delete supported)
   stats [agent]             Show backup statistics
   discover                  Scan for new AI agents (--auto, --list)
@@ -595,7 +596,10 @@ A: No. asb falls back to `cp` if rsync isn't available, though rsync provides mo
 A: Use `asb export <agent> backup.tar.gz` on the source machine, copy the file, then `asb import backup.tar.gz` on the destination.
 
 **Q: What files are excluded from backups?**
-A: Log files (`*.log`), cache directories (`cache/`, `Cache/`, `.cache/`), and SQLite temp files (`*.sqlite3-wal`, `*.sqlite3-shm`) are excluded by default.
+A: asb backs up settings, not session data. Excluded everywhere: logs (`*.log`), caches (`cache/`, `Cache/`, `.cache/`), session transcripts and edit history (`sessions/`, `archived_sessions/`, `file-history/`, `projects/`, `downloads/`, `shell-snapshots/`), SQLite write-ahead sidecars (`*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite3-wal`, `*.sqlite3-shm`, `*.db-wal`, `*.db-shm`), and Codex's session databases (`thread_history_*.sqlite`, `logs_*.sqlite`, `db-backups/`). Antigravity's `antigravity-cli/conversations/` and `antigravity-cli/brain/` are excluded under `~/.gemini`. Restore never deletes these from the live folder.
+
+**Q: My backup folder is huge. How do I shrink it?**
+A: Backups made before an exclusion existed still contain that data, and every earlier commit keeps its copies (re-committing a multi-GB database every night grows `.git` by gigabytes). `asb prune <agent> --dry-run` shows what the current policy excludes; `asb prune <agent>` removes it in a new commit, which stops it being carried forward. To actually free the space, `asb prune <agent> --reinit` also resets that backup's history to a single commit and garbage-collects. That drops every earlier commit and tag, so `asb export` first if you need them. Both steps ask for confirmation unless you pass `--force`.
 
 **Q: Can I run backups automatically?**
 A: Yes! Use `asb schedule --systemd --interval daily` for systemd timers or `asb schedule --cron --interval weekly` for cron jobs.

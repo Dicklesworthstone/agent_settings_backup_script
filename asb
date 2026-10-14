@@ -445,9 +445,13 @@ Thumbs.db
 **/Cache/
 **/.cache/
 
-# Session files that may be large
+# SQLite write-ahead sidecars (never a consistent snapshot)
 *.sqlite3-wal
 *.sqlite3-shm
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
 EOF
 
         # Initial commit
@@ -505,66 +509,121 @@ create_backup_commit() {
 # BACKUP OPERATIONS
 #==============================================================================
 
-# Shared rsync exclusions for backup AND restore.
+# Backup policy: agent SETTINGS are backed up; session DATA is not.
 #
-# ASB backs up agent SETTINGS. Session transcripts and per-file edit history
-# are data, not settings — on real machines they reach 50GB+ (~/.codex/sessions,
-# ~/.claude/file-history, ~/.claude/projects), which makes backups enormous,
-# slow (multi-hour git adds), and secrets-adjacent.
+# Session transcripts and per-file edit history are data, not settings — on
+# real machines they reach 50GB+ (~/.codex/sessions, ~/.claude/file-history,
+# ~/.claude/projects), which makes backups enormous, slow (multi-hour git adds),
+# and secrets-adjacent. Newer agents keep the same data in databases: Codex's
+# thread_history_N.sqlite / logs_N.sqlite (a nightly backup re-committed a
+# 3.9 GB thread database 47 times, leaving a 40 GB .git) and Antigravity's
+# conversations/ and brain/ under ~/.gemini/antigravity-cli. SQLite WAL/SHM
+# sidecars are never a consistent snapshot on their own.
 #
-# The same list is applied on restore so that `rsync --delete` never removes
-# live session data that is (by design) absent from the backup.
-ASB_RSYNC_EXCLUDES=(
-    --exclude='.git'
-    --exclude='.gitignore'
-    --exclude='*.log'
-    --exclude='cache/'
-    --exclude='Cache/'
-    --exclude='.cache/'
-    --exclude='*.sqlite3-wal'
-    --exclude='*.sqlite3-shm'
-    --exclude='sessions/'
-    --exclude='archived_sessions/'
-    --exclude='file-history/'
-    --exclude='projects/'
-    --exclude='downloads/'
-    --exclude='shell-snapshots/'
+# These three arrays are the single source of truth. The rsync rules, the
+# diff rules, the cp fallbacks and `asb prune` are all derived from them, and
+# the same rules apply on restore so that `rsync --delete` never removes live
+# data that is (by design) absent from the backup.
+
+# Directory names excluded at any depth.
+ASB_EXCLUDED_DIRS=(
+    cache Cache .cache
+    sessions archived_sessions file-history projects downloads shell-snapshots
+    db-backups
 )
 
-# Top-level directory names the cp fallbacks must never copy into a backup
-# nor delete from a live config dir (mirrors ASB_RSYNC_EXCLUDES).
-ASB_EXCLUDED_NAMES=(
-    sessions archived_sessions file-history projects downloads
-    shell-snapshots cache Cache .cache
+# File-name globs excluded at any depth.
+ASB_EXCLUDED_FILE_GLOBS=(
+    '*.log'
+    '*.sqlite3-wal' '*.sqlite3-shm'
+    '*.sqlite-wal' '*.sqlite-shm'
+    '*.db-wal' '*.db-shm'
+    'thread_history_*.sqlite'
+    'logs_*.sqlite'
 )
 
-# The same policy for `diff -rq` previews and change detection (diff matches
-# basenames, so no trailing slashes). Without this, previews would list live
-# session data as "will be DELETED" (restore never touches it) and excluded-
-# only differences would trigger no-op restores.
-ASB_DIFF_EXCLUDES=(
-    --exclude='.git'
-    --exclude='.gitignore'
-    --exclude='*.log'
-    --exclude='cache'
-    --exclude='Cache'
-    --exclude='.cache'
-    --exclude='*.sqlite3-wal'
-    --exclude='*.sqlite3-shm'
-    --exclude='sessions'
-    --exclude='archived_sessions'
-    --exclude='file-history'
-    --exclude='projects'
-    --exclude='downloads'
-    --exclude='shell-snapshots'
+# Directories excluded only at this path relative to the agent's root.
+ASB_EXCLUDED_NESTED=(
+    antigravity-cli/conversations
+    antigravity-cli/brain
 )
 
+ASB_RSYNC_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
+# `diff -rq` matches base names only (no trailing slashes).
+ASB_DIFF_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
+for _asb_x in "${ASB_EXCLUDED_DIRS[@]}"; do
+    ASB_RSYNC_EXCLUDES+=("--exclude=${_asb_x}/")
+    ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
+done
+for _asb_x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+    ASB_RSYNC_EXCLUDES+=("--exclude=${_asb_x}")
+    ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
+done
+for _asb_x in "${ASB_EXCLUDED_NESTED[@]}"; do
+    # The leading slash anchors the rule at the agent's root.
+    ASB_RSYNC_EXCLUDES+=("--exclude=/${_asb_x}/")
+    # diff can only express the nested directory's own name; a same-named
+    # directory elsewhere is then hidden from previews too, never deleted.
+    ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x##*/}")
+done
+unset _asb_x
+
+# True if a top-level entry name is excluded (used by the cp fallbacks, which
+# work one top-level entry at a time).
 asb_is_excluded_name() {
     local name="$1" candidate
-    for candidate in "${ASB_EXCLUDED_NAMES[@]}"; do
+    for candidate in "${ASB_EXCLUDED_DIRS[@]}"; do
         [[ "$name" == "$candidate" ]] && return 0
     done
+    for candidate in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+        # shellcheck disable=SC2053 # the right-hand side is a glob on purpose
+        [[ "$name" == $candidate ]] && return 0
+    done
     return 1
+}
+
+# True if a top-level entry contains an excluded nested path (antigravity-cli).
+# The restore cp fallback must not delete such an entry wholesale: the backup
+# lacks its excluded part, so that would destroy live data.
+asb_holds_nested_exclusion() {
+    local name="$1" nested
+    for nested in "${ASB_EXCLUDED_NESTED[@]}"; do
+        [[ "${nested%%/*}" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+# Git pathspecs matching every path the policy excludes, into ASB_PRUNE_PATHSPECS.
+asb_excluded_pathspecs() {
+    local x
+    ASB_PRUNE_PATHSPECS=()
+    for x in "${ASB_EXCLUDED_DIRS[@]}"; do
+        ASB_PRUNE_PATHSPECS+=(":(glob)**/${x}/**")
+    done
+    for x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+        ASB_PRUNE_PATHSPECS+=(":(glob)**/${x}")
+    done
+    for x in "${ASB_EXCLUDED_NESTED[@]}"; do
+        ASB_PRUNE_PATHSPECS+=(":(glob)${x}/**")
+    done
+}
+
+# Remove policy-excluded paths below the top level of a backup directory.
+# Only the cp fallback needs this; rsync applies the same rules itself.
+asb_strip_excluded() {
+    local dir="$1" x
+    local -a find_args=()
+    for x in "${ASB_EXCLUDED_DIRS[@]}"; do
+        find_args+=(-o \( -type d -name "$x" \))
+    done
+    for x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+        find_args+=(-o \( ! -type d -name "$x" \))
+    done
+    find "$dir" -mindepth 1 \( -path "$dir/.git" "${find_args[@]}" \) -prune \
+        ! -path "$dir/.git" -exec rm -rf {} + 2>/dev/null || true
+    for x in "${ASB_EXCLUDED_NESTED[@]}"; do
+        rm -rf "${dir:?}/${x}" 2>/dev/null || true
+    done
 }
 
 backup_agent() {
@@ -684,6 +743,9 @@ backup_agent() {
         if [[ "$git_preserved" == "true" ]]; then
             mv "$dest/.git.asb_preserve" "$dest/.git" 2>/dev/null || true
         fi
+        # The loop above filters top-level names only; drop deeper excluded
+        # paths too, so the fallback produces what rsync would.
+        asb_strip_excluded "$dest"
     fi
 
     # Create commit if auto-commit is enabled
@@ -1140,12 +1202,26 @@ restore_agent() {
             [[ -e "$_entry" || -L "$_entry" ]] || continue
             _name="$(basename "$_entry")"
             asb_is_excluded_name "$_name" && continue
+            # Holds live data the backup excludes (antigravity-cli/conversations):
+            # merge over it below instead of deleting it.
+            asb_holds_nested_exclusion "$_name" && continue
             rm -rf "$_entry" 2>/dev/null
         done
-        # Copy all files including hidden ones (use /. to include dotfiles)
-        cp -r "$source"/. "$dest/" 2>/dev/null || true
-        # Remove .git and .gitignore that came from backup (shouldn't be in destination)
-        rm -rf "$dest/.git" "$dest/.gitignore" 2>/dev/null
+        # Copy the backup through a staging dir stripped by the same policy,
+        # so a backup made before an exclusion existed cannot overwrite live
+        # session data with older copies (rsync never touches excluded paths).
+        local _stage
+        if _stage=$(mktemp -d 2>/dev/null || mktemp -d -t asb-restore.XXXXXXXX); then
+            cp -r "$source"/. "$_stage/" 2>/dev/null || true
+            rm -rf "${_stage:?}/.git" "${_stage:?}/.gitignore" 2>/dev/null
+            asb_strip_excluded "$_stage"
+            cp -r "$_stage"/. "$dest/" 2>/dev/null || true
+            rm -rf "${_stage:?}" 2>/dev/null
+        else
+            log_warn "Could not create a staging directory; restoring without the exclusion filter"
+            cp -r "$source"/. "$dest/" 2>/dev/null || true
+            rm -rf "$dest/.git" "$dest/.gitignore" 2>/dev/null
+        fi
     fi
 
     # Reset to HEAD if we checked out a specific commit
@@ -3427,7 +3503,7 @@ _asb_completions() {
     done
 
     # All commands
-    local commands="backup restore export import list stats discover history diff verify tag schedule hooks init config help version completion"
+    local commands="backup restore export import list stats discover history diff verify prune tag schedule hooks init config help version completion"
 
     # All agent names (keep in sync with AGENT_FOLDERS)
     local agents="aider amazonq amp claude cline codex cursor factory gemini opencode plandex qwencode windsurf"
@@ -3452,7 +3528,7 @@ _asb_completions() {
         -n|--dry-run|-f|--force|-v|--verbose|-j|--json)
             COMPREPLY=($(compgen -W "$commands" -- "$cur"))
             ;;
-        backup|b|verify|v)
+        backup|b|verify|v|prune)
             COMPREPLY=($(compgen -W "$agents" -- "$cur"))
             ;;
         restore|r|history|h|log|diff|d|export|ex|tag|t|stats|st)
@@ -3530,6 +3606,7 @@ _asb() {
         'history:Show backup history'
         'diff:Show changes since last backup'
         'verify:Verify backup integrity'
+        'prune:Drop data the backup policy excludes'
         'tag:Tag a backup with a name'
         'schedule:Set up automated backups'
         'hooks:List configured hooks'
@@ -3620,7 +3697,7 @@ _asb() {
             done
 
             case "$cmd" in
-                backup|b|verify|v)
+                backup|b|verify|v|prune)
                     _describe 'agent' agents
                     ;;
                 restore|r|history|h|log|diff|d|export|ex|stats|st)
@@ -3721,6 +3798,7 @@ complete -c asb -n '__fish_use_subcommand' -a discover -d 'Scan for new AI agent
 complete -c asb -n '__fish_use_subcommand' -a history -d 'Show backup history'
 complete -c asb -n '__fish_use_subcommand' -a diff -d 'Show changes since last backup'
 complete -c asb -n '__fish_use_subcommand' -a verify -d 'Verify backup integrity'
+complete -c asb -n '__fish_use_subcommand' -a prune -d 'Drop data the backup policy excludes'
 complete -c asb -n '__fish_use_subcommand' -a tag -d 'Tag a backup with a name'
 complete -c asb -n '__fish_use_subcommand' -a schedule -d 'Set up automated backups'
 complete -c asb -n '__fish_use_subcommand' -a hooks -d 'List configured hooks'
@@ -3735,7 +3813,7 @@ complete -c asb -s f -l force -d 'Skip confirmation prompts'
 complete -c asb -s v -l verbose -d 'Show detailed output'
 complete -c asb -s j -l json -d 'Output in JSON format'
 
-set -l agent_commands backup restore history diff verify export tag
+set -l agent_commands backup restore history diff verify prune export tag
 
 for cmd in $agent_commands
     complete -c asb -n "__fish_seen_subcommand_from $cmd" -a 'aider' -d 'Aider'
@@ -3811,6 +3889,9 @@ ${BOLD}COMMANDS${RESET}
     history <agent>           Show backup history for an agent
     diff <agent>              Show changes since last backup
     verify [agents...]        Verify backup integrity (all if none specified)
+    prune [agents...] [--reinit]
+                              Drop data the backup policy excludes from existing
+                              backups; --reinit also resets history to free space
     tag <agent> <name>        Tag a backup commit with a meaningful name
     schedule [options]        Set up automated scheduled backups
     hooks --list              List configured hooks
@@ -3938,6 +4019,216 @@ show_version() {
 #==============================================================================
 # MAIN
 #==============================================================================
+
+#==============================================================================
+# PRUNE
+#==============================================================================
+
+# Ask before a destructive prune step. --force skips the prompt; without a TTY
+# and without --force, refuse.
+confirm_prune() {
+    local question="$1"
+    [[ "$FORCE" == "true" ]] && return 0
+    if [[ ! -t 0 ]]; then
+        log_error "Prune requires confirmation. Use --force for non-interactive mode."
+        return 1
+    fi
+    printf '%s [y/N] ' "$question" >&2
+    local response
+    IFS= read -r response
+    case "$response" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        *) log_info "Prune cancelled"; return 1 ;;
+    esac
+}
+
+asb_dir_kib() {
+    if [[ -d "$1" ]]; then
+        du -sk "$1" 2>/dev/null | awk '{print $1 + 0}'
+    else
+        echo 0
+    fi
+}
+
+asb_kib_human() {
+    awk -v k="${1:-0}" 'BEGIN {
+        split("KiB MiB GiB TiB", u); i = 1
+        while (k >= 1024 && i < 4) { k /= 1024; i++ }
+        if (i == 1) printf "%d %s", k, u[i]; else printf "%.1f %s", k, u[i]
+    }'
+}
+
+# Prune one backup. Removes tracked paths that the current policy excludes
+# (copies made before an exclusion existed; rsync never deletes excluded
+# destination files, so they stay forever) and commits. With reinit=true it
+# also resets the history to a single commit and garbage-collects, which is
+# what actually frees the space: every earlier version stays in .git otherwise.
+# Sets PRUNE_AGENT_RESULT (JSON object).
+prune_agent() {
+    local agent="$1" reinit="$2"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local jname dest
+    jname=$(json_escape_string "$agent_name")
+    dest=$(get_agent_backup_dir "$agent")
+    PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"no_backup\"}"
+    if [[ ! -d "$dest/.git" ]]; then
+        is_json_output || log_warn "${agent_name}: No backup found"
+        return 1
+    fi
+
+    asb_excluded_pathspecs
+    local -a paths=()
+    local _path
+    # read -d '' rather than mapfile -d: asb supports Bash 4.0+, mapfile -d is 4.4+.
+    while IFS= read -r -d '' _path; do
+        paths+=("$_path")
+    done < <(git -C "$dest" ls-files -z -- "${ASB_PRUNE_PATHSPECS[@]}" 2>/dev/null)
+    local count=${#paths[@]} excluded_bytes=0
+    if (( count > 0 )); then
+        excluded_bytes=$(git -C "$dest" ls-files -s -- "${ASB_PRUNE_PATHSPECS[@]}" 2>/dev/null \
+            | awk '{print $2}' \
+            | git -C "$dest" cat-file --batch-check='%(objectsize)' 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+$/ {s += $1} END {printf "%d", s}')
+    fi
+
+    local branch commits git_kib history_holds=false
+    branch=$(git -C "$dest" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    commits=$(git -C "$dest" rev-list --count HEAD 2>/dev/null || echo 0)
+    git_kib=$(asb_dir_kib "$dest/.git")
+    [[ -n "$(git -C "$dest" log --all --format=%H -1 -- "${ASB_PRUNE_PATHSPECS[@]}" 2>/dev/null)" ]] && history_holds=true
+    # Every ref except the current branch keeps old history alive.
+    local -a other_refs=()
+    mapfile -t other_refs < <(git -C "$dest" for-each-ref --format='%(refname)' | grep -vxF -- "refs/heads/${branch:-//none//}")
+    local tags
+    tags=$(printf '%s\n' "${other_refs[@]}" | grep -c '^refs/tags/' || true)
+
+    local fields="\"excluded_paths\":${count},\"excluded_bytes\":${excluded_bytes},\"history_holds_excluded\":${history_holds},\"commits\":${commits},\"tags\":${tags},\"git_bytes\":$((git_kib * 1024)),\"reinit\":${reinit}"
+
+    if ! is_json_output; then
+        log_step "${agent_name}: ${count} tracked path(s) excluded by the backup policy ($(asb_kib_human $((excluded_bytes / 1024))))"
+        local shown
+        for shown in "${paths[@]:0:10}"; do
+            printf '    %s\n' "$shown" >&2
+        done
+        (( count > 10 )) && printf '    ... and %d more\n' $((count - 10)) >&2
+        log_info "  history: ${commits} commit(s), ${tags} tag(s), .git $(asb_kib_human "$git_kib")"
+    fi
+
+    if (( count == 0 )) && [[ "$reinit" != "true" ]]; then
+        if ! is_json_output; then
+            log_success "${agent_name}: nothing to prune"
+            [[ "$history_holds" == "true" ]] && \
+                log_info "  Earlier commits still hold excluded data; 'asb prune --reinit ${agent}' resets the history to free it"
+        fi
+        PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"clean\",${fields}}"
+        return 0
+    fi
+
+    if is_dry_run; then
+        if ! is_json_output; then
+            (( count > 0 )) && log_dry "Would remove ${count} path(s) from the ${agent_name} backup and commit"
+            [[ "$reinit" == "true" ]] && \
+                log_dry "Would reset ${agent_name} history to one commit (dropping ${commits} commit(s), ${#other_refs[@]} other ref(s) incl. ${tags} tag(s)) and garbage-collect"
+        fi
+        PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"dry_run\",${fields}}"
+        return 0
+    fi
+
+    if [[ "$reinit" == "true" && -z "$branch" ]]; then
+        is_json_output || log_error "${agent_name}: backup is not on a branch (detached HEAD); refusing --reinit"
+        PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"detached_head\",${fields}}"
+        return 1
+    fi
+
+    if (( count > 0 )); then
+        if ! confirm_prune "Remove ${count} excluded path(s) from the ${agent_name} backup?"; then
+            PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"cancelled\",${fields}}"
+            return 1
+        fi
+        if ! git -C "$dest" rm -r -q --ignore-unmatch -- "${ASB_PRUNE_PATHSPECS[@]}" >/dev/null 2>&1 \
+            || ! git -C "$dest" commit -q -m "Prune ${agent_name}: remove ${count} path(s) excluded by the backup policy" >/dev/null 2>&1; then
+            is_json_output || log_error "${agent_name}: failed to remove excluded paths"
+            PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"remove_failed\",${fields}}"
+            return 1
+        fi
+        is_json_output || log_success "${agent_name}: removed ${count} excluded path(s)"
+    fi
+
+    local git_kib_after="$git_kib"
+    if [[ "$reinit" == "true" ]]; then
+        if ! confirm_prune "Reset the ${agent_name} backup history to one commit? This drops ${commits} commit(s) and ${#other_refs[@]} other ref(s) (${tags} tag(s)) and cannot be undone."; then
+            PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"cancelled\",${fields}}"
+            return 1
+        fi
+        local tree root ref
+        if ! tree=$(git -C "$dest" rev-parse "HEAD^{tree}" 2>/dev/null) \
+            || ! root=$(git -C "$dest" commit-tree "$tree" -m "Reset ${agent_name} backup history (asb prune --reinit; was ${commits} commits)" 2>/dev/null) \
+            || ! git -C "$dest" update-ref "refs/heads/${branch}" "$root" >/dev/null 2>&1; then
+            is_json_output || log_error "${agent_name}: failed to reset history"
+            PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"reinit_failed\",${fields}}"
+            return 1
+        fi
+        for ref in "${other_refs[@]}"; do
+            [[ -n "$ref" ]] && git -C "$dest" update-ref -d "$ref" >/dev/null 2>&1
+        done
+        git -C "$dest" reflog expire --expire=now --all >/dev/null 2>&1
+        git -C "$dest" gc --prune=now --quiet >/dev/null 2>&1
+        git_kib_after=$(asb_dir_kib "$dest/.git")
+        is_json_output || log_success "${agent_name}: history reset; .git $(asb_kib_human "$git_kib") -> $(asb_kib_human "$git_kib_after")"
+    fi
+
+    PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"pruned\",${fields},\"removed_paths\":${count},\"git_bytes_after\":$((git_kib_after * 1024))}"
+    return 0
+}
+
+# asb prune [agents...] [--reinit]
+prune_command() {
+    local reinit=false arg agent status=0
+    local -a agents=() results=()
+    for arg in "$@"; do
+        case "$arg" in
+            --reinit) reinit=true ;;
+            -*)
+                log_error "Unknown prune option: ${arg}"
+                log_info "Usage: asb prune [agents...] [--reinit]"
+                return 1
+                ;;
+            *) agents+=("$arg") ;;
+        esac
+    done
+
+    if [[ ${#agents[@]} -eq 0 ]]; then
+        for agent in "${!AGENT_FOLDERS[@]}"; do
+            [[ -d "$(get_agent_backup_dir "$agent")/.git" ]] && agents+=("$agent")
+        done
+        if [[ ${#agents[@]} -gt 0 ]]; then
+            mapfile -t agents < <(printf '%s\n' "${agents[@]}" | sort)
+        fi
+    fi
+
+    if [[ ${#agents[@]} -eq 0 ]] && ! is_json_output; then
+        log_warn "No backups found to prune"
+    fi
+
+    for agent in "${agents[@]}"; do
+        if ! agent_exists "$agent"; then
+            is_json_output || log_error "Unknown agent: ${agent}"
+            results+=("{\"agent\":\"$(json_escape_string "$agent")\",\"status\":\"unknown_agent\"}")
+            status=1
+            continue
+        fi
+        prune_agent "$agent" "$reinit" || status=1
+        results+=("$PRUNE_AGENT_RESULT")
+    done
+
+    if is_json_output; then
+        local dry=false joined
+        is_dry_run && dry=true
+        joined=$(IFS=,; printf '%s' "${results[*]}")
+        json_output "{\"command\":\"prune\",\"dry_run\":${dry},\"reinit\":${reinit},\"results\":[${joined}]}"
+    fi
+    return $status
+}
 
 main() {
     # Check for git
@@ -4081,6 +4372,9 @@ main() {
             ;;
         verify|v)
             verify_all "$@"
+            ;;
+        prune)
+            prune_command "$@"
             ;;
         tag|t)
             tag_command "$@"
