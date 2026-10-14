@@ -338,6 +338,7 @@ Environment variables:
 | `ASB_BACKUP_ROOT` | `~/.agent_settings_backups` | Backup location |
 | `ASB_AUTO_COMMIT` | `true` | Auto-commit on backup |
 | `ASB_VERBOSE` | `false` | Verbose output |
+| `ASB_LOCK_WAIT` | `300` | Seconds a backup, restore, import, tag or prune waits while another asb writes the same agent's backup |
 
 ## Hooks
 

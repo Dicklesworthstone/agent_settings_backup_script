@@ -36,11 +36,13 @@ test_rsync_excludes_derived_from_policy() {
     assert_contains "$joined" " --exclude=/antigravity-cli/conversations/ " || return 1
 }
 
-test_diff_excludes_use_base_names() {
+test_diff_excludes_skip_nested_rules() {
     local joined=" ${ASB_DIFF_EXCLUDES[*]} "
     assert_contains "$joined" " --exclude=sessions " || return 1
-    assert_contains "$joined" " --exclude=conversations " || return 1
     assert_contains "$joined" " --exclude=logs_*.sqlite " || return 1
+    # Nested rules are anchored; diff would apply a base name everywhere.
+    assert_not_contains "$joined" " --exclude=conversations " || return 1
+    assert_not_contains "$joined" " --exclude=brain " || return 1
 }
 
 test_pathspecs_select_excluded_tracked_files() {
@@ -80,10 +82,41 @@ test_strip_excluded_matches_rsync_policy() {
     assert_file_exists "$dir/keep/config.toml" || return 1
 }
 
+test_strip_excluded_does_not_follow_symlinks() {
+    local dir="${TEST_ENV_ROOT}/strip_link" outside="${TEST_ENV_ROOT}/strip_outside"
+    mkdir -p "$dir" "${outside}/conversations" "${outside}/brain"
+    printf 'live\n' > "${outside}/conversations/c.db"
+    printf 'live\n' > "${outside}/brain/t.jsonl"
+    ln -s "$outside" "$dir/antigravity-cli"
+
+    asb_strip_excluded "$dir"
+
+    assert_file_exists "${outside}/conversations/c.db" || return 1
+    assert_file_exists "${outside}/brain/t.jsonl" || return 1
+    [[ -L "$dir/antigravity-cli" ]] || return 1
+}
+
+test_filter_nested_diff_is_anchored() {
+    local a="/x/live" b="/x/backup" got
+    got=$(printf '%s\n' \
+        "Only in ${a}/antigravity-cli: conversations" \
+        "Only in ${a}/antigravity-cli/brain: t.jsonl" \
+        "Files ${a}/antigravity-cli/conversations/c.db and ${b}/antigravity-cli/conversations/c.db differ" \
+        "Files ${a}/tools/conversations/p.md and ${b}/tools/conversations/p.md differ" \
+        "Only in ${b}/tools: brain" \
+        "Files ${a}/antigravity-cli/settings.json and ${b}/antigravity-cli/settings.json differ" \
+        | asb_filter_nested_diff "$a" "$b")
+    assert_equals "Files ${a}/tools/conversations/p.md and ${b}/tools/conversations/p.md differ
+Only in ${b}/tools: brain
+Files ${a}/antigravity-cli/settings.json and ${b}/antigravity-cli/settings.json differ" "$got" || return 1
+}
+
 run_unit_test "excluded_name_matches_dirs_and_globs" test_excluded_name_matches_dirs_and_globs
 run_unit_test "excluded_name_keeps_settings" test_excluded_name_keeps_settings
 run_unit_test "holds_nested_exclusion" test_holds_nested_exclusion
 run_unit_test "rsync_excludes_derived_from_policy" test_rsync_excludes_derived_from_policy
-run_unit_test "diff_excludes_use_base_names" test_diff_excludes_use_base_names
+run_unit_test "diff_excludes_skip_nested_rules" test_diff_excludes_skip_nested_rules
 run_unit_test "pathspecs_select_excluded_tracked_files" test_pathspecs_select_excluded_tracked_files
 run_unit_test "strip_excluded_matches_rsync_policy" test_strip_excluded_matches_rsync_policy
+run_unit_test "strip_excluded_does_not_follow_symlinks" test_strip_excluded_does_not_follow_symlinks
+run_unit_test "filter_nested_diff_is_anchored" test_filter_nested_diff_is_anchored

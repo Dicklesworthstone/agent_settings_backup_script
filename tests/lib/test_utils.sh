@@ -87,6 +87,18 @@ skip_test() {
     return 2
 }
 
+# Failed run_test calls in this suite; finish_suite turns them into its exit status.
+ASB_SUITE_FAILURES=0
+
+# End a suite that runs every test regardless of earlier failures.
+finish_suite() {
+    if (( ASB_SUITE_FAILURES > 0 )); then
+        log_error "${ASB_SUITE_FAILURES} test(s) failed"
+        exit 1
+    fi
+    exit 0
+}
+
 run_test() {
     local test_name="$1"
     local func="$2"
@@ -109,6 +121,7 @@ run_test() {
             return 0
         fi
         log_fail "$test_name"
+        ASB_SUITE_FAILURES=$((ASB_SUITE_FAILURES + 1))
         preserve_artifacts "$test_name"
         teardown_test_env
         clear_current_test

@@ -227,6 +227,192 @@ test_cp_fallback_restore_ignores_legacy_excluded_copies() {
     assert_equals "live newer" "$(cat "${HOME}/.gemini/antigravity-cli/conversations/abc.db")" || return 1
 }
 
+# ~/.gemini/antigravity-cli as a link to data kept outside the agent's folder.
+# GNU cp -r copies the link itself, so the cp fallbacks see a symlink there.
+add_symlinked_antigravity_tree() {
+    local outside="${TEST_ENV_ROOT}/outside-agy"
+    mkdir -p "${outside}/conversations" "${outside}/brain/abc"
+    printf '{"model":"x"}\n' > "${outside}/settings.json"
+    printf 'conversation\n' > "${outside}/conversations/abc.db"
+    printf 'transcript\n' > "${outside}/brain/abc/t.jsonl"
+    printf 'sentinel\n' > "${outside}/sentinel"
+    ln -s "$outside" "${HOME}/.gemini/antigravity-cli"
+}
+
+assert_outside_agy_intact() {
+    local outside="${TEST_ENV_ROOT}/outside-agy"
+    assert_equals "conversation" "$(cat "${outside}/conversations/abc.db" 2>/dev/null)" || return 1
+    assert_equals "transcript" "$(cat "${outside}/brain/abc/t.jsonl" 2>/dev/null)" || return 1
+    assert_equals "sentinel" "$(cat "${outside}/sentinel" 2>/dev/null)" || return 1
+}
+
+test_cp_fallback_backup_does_not_follow_symlinks() {
+    create_mock_agent "gemini"
+    add_symlinked_antigravity_tree
+    use_failing_rsync
+
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_outside_agy_intact || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.gemini" ls-files | grep -E 'conversations|brain' || true)" || return 1
+}
+
+test_cp_fallback_restore_does_not_follow_symlinks() {
+    create_mock_agent "gemini"
+    add_symlinked_antigravity_tree
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    # A real difference outside the link, so the restore actually runs.
+    printf '{"changed":true}\n' > "${HOME}/.gemini/settings.json"
+    use_failing_rsync
+
+    run_asb restore gemini --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_outside_agy_intact || return 1
+    assert_contains "$(cat "${HOME}/.gemini/settings.json")" '"agent":"gemini"' || return 1
+}
+
+test_cp_fallback_restore_refuses_when_staging_fails() {
+    create_mock_agent "gemini"
+    add_antigravity_tree
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    printf '{"model":"changed"}\n' > "${HOME}/.gemini/antigravity-cli/settings.json"
+    printf 'live only\n' > "${HOME}/.gemini/antigravity-cli/conversations/new.db"
+    local before
+    before=$(cd "${HOME}/.gemini" && find . -type f -exec cksum {} + | sort)
+    # Every copy out of the backup fails, so the staging copy does too.
+    local real_cp
+    real_cp=$(command -v cp)
+    use_failing_rsync
+    printf '#!/bin/sh\ncase "$*" in *"%s/"*) exit 1 ;; esac\nexec "%s" "$@"\n' \
+        "$ASB_BACKUP_ROOT" "$real_cp" > "${TEST_ENV_ROOT}/fakebin/cp"
+    chmod +x "${TEST_ENV_ROOT}/fakebin/cp"
+
+    run_asb restore gemini --force
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "nothing was restored" || return 1
+    assert_equals "$before" "$(cd "${HOME}/.gemini" && find . -type f -exec cksum {} + | sort)" || return 1
+}
+
+test_diff_shows_same_named_dirs_outside_antigravity() {
+    create_mock_agent "gemini"
+    add_antigravity_tree
+    mkdir -p "${HOME}/.gemini/tools/conversations"
+    printf 'v1\n' > "${HOME}/.gemini/tools/conversations/prompt.md"
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    printf 'v2\n' > "${HOME}/.gemini/tools/conversations/prompt.md"
+    printf 'live only\n' > "${HOME}/.gemini/antigravity-cli/conversations/new.db"
+
+    run_asb diff gemini
+    assert_contains "$ASB_LAST_OUTPUT" "tools/conversations/prompt.md" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "new.db" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "antigravity-cli/conversations" || return 1
+}
+
+test_restore_preview_shows_same_named_dirs_outside_antigravity() {
+    create_mock_agent "gemini"
+    add_antigravity_tree
+    mkdir -p "${HOME}/.gemini/tools/brain"
+    printf 'v1\n' > "${HOME}/.gemini/tools/brain/notes.md"
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    # Only the same-named directory differs: an anchored filter still sees a
+    # change, so the restore runs and puts v1 back.
+    printf 'v2\n' > "${HOME}/.gemini/tools/brain/notes.md"
+
+    run_asb restore gemini --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_equals "v1" "$(cat "${HOME}/.gemini/tools/brain/notes.md")" || return 1
+}
+
+test_prune_reinit_refuses_when_branch_moved() {
+    create_codex_fixture
+    run_asb backup codex
+    local mirror="${ASB_BACKUP_ROOT}/.codex"
+    commit_legacy_file "$mirror" "thread_history_1.sqlite"
+    # Another git writer commits after prune inspected the backup: a git
+    # wrapper adds one just as prune builds the replacement root commit.
+    local real_git
+    real_git=$(command -v git)
+    local bin="${TEST_ENV_ROOT}/racebin"
+    mkdir -p "$bin"
+    cat > "${bin}/git" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+    if [[ "\$a" == "commit-tree" ]]; then
+        printf 'late\n' > "${mirror}/late.txt"
+        "${real_git}" -C "${mirror}" add late.txt >/dev/null 2>&1
+        "${real_git}" -C "${mirror}" commit -q -m "late backup" >/dev/null 2>&1
+        break
+    fi
+done
+exec "${real_git}" "\$@"
+EOF
+    chmod +x "${bin}/git"
+    export PATH="${bin}:${PATH}"
+    local late_count
+    run_asb --force prune codex --reinit
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    late_count=$(git -C "$mirror" log --format=%s | grep -c '^late backup$' || true)
+    assert_equals "1" "$late_count" || return 1
+    assert_contains "$(git -C "$mirror" show HEAD:late.txt 2>/dev/null)" "late" || return 1
+    # Recovery history survives: the pre-prune commits are still reachable.
+    assert_contains "$(git -C "$mirror" log --format=%s)" "legacy backup with thread_history_1.sqlite" || return 1
+}
+
+test_write_commands_refuse_while_locked() {
+    create_codex_fixture
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    # A live asb (this test shell) is writing the codex backup.
+    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
+    printf '%s\n' "$$" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+    export ASB_LOCK_WAIT=0
+
+    run_asb backup codex
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Another asb operation (pid $$)" || return 1
+    run_asb --force prune codex --reinit
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    run_asb restore codex --force
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    # Other agents, read-only commands and dry runs are not blocked.
+    create_mock_agent "gemini"
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    run_asb history codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    run_asb --dry-run prune codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+}
+
+test_writer_waits_for_lock_holder() {
+    create_codex_fixture
+    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
+    sleep 2 &
+    local holder=$!
+    printf '%s\n' "$holder" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+    export ASB_LOCK_WAIT=30
+
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Waiting for asb pid ${holder}" || return 1
+    assert_dir_not_exists "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock" || return 1
+}
+
+test_stale_write_lock_is_taken_over() {
+    create_codex_fixture
+    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
+    # A pid that cannot be running.
+    printf '%s\n' "999999999" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_dir_not_exists "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock" || return 1
+}
+
 test_prune_json() {
     create_codex_fixture
     run_asb backup codex
@@ -249,18 +435,27 @@ test_prune_unknown_option() {
     assert_contains "$ASB_LAST_OUTPUT" "Unknown prune option" || return 1
 }
 
-run_test "backup_excludes_codex_session_databases" test_backup_excludes_codex_session_databases || true
-run_test "backup_excludes_antigravity_transcripts" test_backup_excludes_antigravity_transcripts || true
-run_test "restore_keeps_live_antigravity_transcripts" test_restore_keeps_live_antigravity_transcripts || true
-run_test "prune_dry_run_changes_nothing" test_prune_dry_run_changes_nothing || true
-run_test "prune_removes_legacy_excluded_files" test_prune_removes_legacy_excluded_files || true
-run_test "prune_reinit_drops_history" test_prune_reinit_drops_history || true
-run_test "prune_clean_backup_is_noop" test_prune_clean_backup_is_noop || true
-run_test "prune_requires_confirmation_without_tty" test_prune_requires_confirmation_without_tty || true
-run_test "cp_fallback_backup_applies_policy" test_cp_fallback_backup_applies_policy || true
-run_test "cp_fallback_restore_keeps_live_transcripts" test_cp_fallback_restore_keeps_live_transcripts || true
-run_test "cp_fallback_restore_ignores_legacy_excluded_copies" test_cp_fallback_restore_ignores_legacy_excluded_copies || true
-run_test "prune_json" test_prune_json || true
-run_test "prune_unknown_option" test_prune_unknown_option || true
+run_test "backup_excludes_codex_session_databases" test_backup_excludes_codex_session_databases
+run_test "backup_excludes_antigravity_transcripts" test_backup_excludes_antigravity_transcripts
+run_test "restore_keeps_live_antigravity_transcripts" test_restore_keeps_live_antigravity_transcripts
+run_test "prune_dry_run_changes_nothing" test_prune_dry_run_changes_nothing
+run_test "prune_removes_legacy_excluded_files" test_prune_removes_legacy_excluded_files
+run_test "prune_reinit_drops_history" test_prune_reinit_drops_history
+run_test "prune_clean_backup_is_noop" test_prune_clean_backup_is_noop
+run_test "prune_requires_confirmation_without_tty" test_prune_requires_confirmation_without_tty
+run_test "cp_fallback_backup_applies_policy" test_cp_fallback_backup_applies_policy
+run_test "cp_fallback_restore_keeps_live_transcripts" test_cp_fallback_restore_keeps_live_transcripts
+run_test "cp_fallback_restore_ignores_legacy_excluded_copies" test_cp_fallback_restore_ignores_legacy_excluded_copies
+run_test "cp_fallback_backup_does_not_follow_symlinks" test_cp_fallback_backup_does_not_follow_symlinks
+run_test "cp_fallback_restore_does_not_follow_symlinks" test_cp_fallback_restore_does_not_follow_symlinks
+run_test "cp_fallback_restore_refuses_when_staging_fails" test_cp_fallback_restore_refuses_when_staging_fails
+run_test "diff_shows_same_named_dirs_outside_antigravity" test_diff_shows_same_named_dirs_outside_antigravity
+run_test "restore_preview_shows_same_named_dirs_outside_antigravity" test_restore_preview_shows_same_named_dirs_outside_antigravity
+run_test "prune_reinit_refuses_when_branch_moved" test_prune_reinit_refuses_when_branch_moved
+run_test "write_commands_refuse_while_locked" test_write_commands_refuse_while_locked
+run_test "writer_waits_for_lock_holder" test_writer_waits_for_lock_holder
+run_test "stale_write_lock_is_taken_over" test_stale_write_lock_is_taken_over
+run_test "prune_json" test_prune_json
+run_test "prune_unknown_option" test_prune_unknown_option
 
-exit 0
+finish_suite
