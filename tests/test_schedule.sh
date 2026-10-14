@@ -28,12 +28,39 @@ test_schedule_help() {
 }
 
 test_schedule_no_mode() {
-    # Should fail if no mode specified
-    run_asb schedule
-    if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
-        # Either shows help or requires a mode
-        assert_contains "$ASB_LAST_OUTPUT" "schedule" || return 0
+    # With neither --cron nor --systemd, asb picks the scheduler it finds.
+    run_asb --dry-run schedule
+    if ! command -v systemctl >/dev/null 2>&1 && ! command -v crontab >/dev/null 2>&1; then
+        assert_exit_code 1 "$ASB_LAST_STATUS"
+        assert_contains "$ASB_LAST_OUTPUT" "No scheduler detected" || return 1
+        return 0
     fi
+    assert_exit_code 0 "$ASB_LAST_STATUS"
+    assert_contains "$ASB_LAST_OUTPUT" "defaulting to" || return 1
+}
+
+# Installs into the per-test crontab (see install_scheduler_shims), never the
+# real one.
+test_schedule_cron_install_and_remove() {
+    command -v crontab >/dev/null 2>&1 || return 2
+    printf '%s\n' "15 3 * * * /usr/bin/true # unrelated" | crontab -
+
+    run_asb schedule --cron --interval daily
+    assert_exit_code 0 "$ASB_LAST_STATUS"
+    local tab
+    tab=$(crontab -l)
+    assert_contains "$tab" "ASB_BACKUP_SCHEDULE" || return 1
+    assert_contains "$tab" "${XDG_STATE_HOME}/asb/asb.log" || return 1
+    assert_contains "$tab" "# unrelated" || return 1
+
+    run_asb schedule --remove --cron
+    assert_exit_code 0 "$ASB_LAST_STATUS"
+    tab=$(crontab -l)
+    if [[ "$tab" == *"ASB_BACKUP_SCHEDULE"* ]]; then
+        echo "cron entry still present after --remove" >&2
+        return 1
+    fi
+    assert_contains "$tab" "# unrelated" || return 1
 }
 
 test_schedule_unknown_option() {
@@ -206,6 +233,7 @@ test_schedule_status_both_modes() {
 # Run all tests
 run_test "schedule_help" test_schedule_help || true
 run_test "schedule_no_mode" test_schedule_no_mode || true
+run_test "schedule_cron_install_and_remove" test_schedule_cron_install_and_remove || true
 run_test "schedule_unknown_option" test_schedule_unknown_option || true
 run_test "schedule_invalid_interval" test_schedule_invalid_interval || true
 run_test "schedule_hourly_interval" test_schedule_hourly_interval || true

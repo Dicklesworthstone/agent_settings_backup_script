@@ -38,8 +38,11 @@ setup_test_env() {
     TEST_ENV_ROOT=$(mktemp -d 2>/dev/null || mktemp -d -t asb-test.XXXXXXXX)
     export HOME="${TEST_ENV_ROOT}/home"
     export XDG_CONFIG_HOME="${TEST_ENV_ROOT}/xdg"
+    export XDG_STATE_HOME="${TEST_ENV_ROOT}/xdg-state"
     export ASB_BACKUP_ROOT="${TEST_ENV_ROOT}/backups"
-    export PATH="${REPO_ROOT}:$PATH"
+    ASB_ORIG_PATH="${ASB_ORIG_PATH:-$PATH}"
+    export PATH="${TEST_ENV_ROOT}/bin:${REPO_ROOT}:${ASB_ORIG_PATH}"
+    install_scheduler_shims
     export GIT_AUTHOR_NAME="ASB Test"
     export GIT_AUTHOR_EMAIL="asb-test@example.com"
     export GIT_COMMITTER_NAME="ASB Test"
@@ -50,6 +53,47 @@ setup_test_env() {
     export GIT_COMMITTER_EMAIL="asb-test@example.com"
 
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$ASB_BACKUP_ROOT"
+}
+
+# crontab and `systemctl --user` act on the real user's schedule even with
+# HOME pointed at the test dir, so a test that schedules would rewrite the
+# developer's crontab. Shadow them: crontab keeps a per-test file, and
+# systemctl may only query. Shims exist only where the real command does, so
+# scheduler auto-detection is unchanged.
+install_scheduler_shims() {
+    local bin="${TEST_ENV_ROOT}/bin" real
+    mkdir -p "$bin"
+    if PATH="$ASB_ORIG_PATH" command -v crontab >/dev/null 2>&1; then
+        cat > "${bin}/crontab" <<EOF
+#!/usr/bin/env bash
+# Test shim: this test's crontab lives in ${TEST_ENV_ROOT}/crontab.
+tab="${TEST_ENV_ROOT}/crontab"
+case "\${1:--}" in
+    -l) [[ -f "\$tab" ]] || { echo "crontab: no crontab (test shim)" >&2; exit 1; }
+        cat "\$tab" ;;
+    -r) rm -f "\$tab" ;;
+    -) cat > "\$tab" ;;
+    -*) echo "crontab test shim: unsupported option \$1" >&2; exit 1 ;;
+    *) cat "\$1" > "\$tab" ;;
+esac
+EOF
+        chmod +x "${bin}/crontab"
+    fi
+    if real=$(PATH="$ASB_ORIG_PATH" command -v systemctl 2>/dev/null); then
+        cat > "${bin}/systemctl" <<EOF
+#!/usr/bin/env bash
+# Test shim: only queries reach the real service manager.
+for arg in "\$@"; do
+    case "\$arg" in
+        enable|disable|reenable|start|stop|restart|reload|daemon-reload|mask|unmask|link|preset|kill|edit|set-property)
+            echo "systemctl test shim: refusing 'systemctl \$*'" >&2
+            exit 1 ;;
+    esac
+done
+exec "${real}" "\$@"
+EOF
+        chmod +x "${bin}/systemctl"
+    fi
 }
 
 teardown_test_env() {
