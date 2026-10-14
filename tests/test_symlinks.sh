@@ -227,7 +227,9 @@ test_export_with_symlinks() {
     assert_file_exists "$export_file" || return 1
 
     # Verify archive contains the file
-    if tar tzf "$export_file" 2>/dev/null | grep -q "link.json\|target.json"; then
+    local listing
+    listing=$(tar tzf "$export_file" 2>/dev/null) || listing=""
+    if [[ "$listing" == *"link.json"* || "$listing" == *"target.json"* ]]; then
         return 0
     fi
     echo "Symlinked files not in archive" >&2

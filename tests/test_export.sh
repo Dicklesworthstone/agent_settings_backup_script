@@ -24,7 +24,11 @@ make_backup_with_history() {
 
 assert_archive_contains_git() {
     local archive="$1"
-    tar -tzf "$archive" 2>/dev/null | grep -q "\.git/objects"
+    # Not `tar | grep -q`: under pipefail, grep exiting at the first match can
+    # kill tar with SIGPIPE and fail the check at random.
+    local listing
+    listing=$(tar -tzf "$archive" 2>/dev/null) || return 1
+    [[ "$listing" == *".git/objects"* ]]
 }
 
 test_export_creates_archive() {
