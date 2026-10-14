@@ -8,14 +8,20 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ## [Unreleased]
 
+---
+
+## [v0.3.3] — 2026-10-14
+
 ### Fixed
 
 - **Backups no longer re-commit session databases.** Codex keeps transcripts and logs in `thread_history_N.sqlite` / `logs_N.sqlite`, and Antigravity keeps them in `~/.gemini/antigravity-cli/conversations/` and `brain/`. These are session data, like the `sessions/` directory asb already excludes. A nightly backup was re-committing a 3.9 GB thread database every run, leaving a 40 GB `.git`. They are now excluded, along with `db-backups/` and the `*.sqlite-wal` / `*.sqlite-shm` / `*.db-wal` / `*.db-shm` sidecars (only `*.sqlite3-*` was excluded before).
+- **Rotated logs and Codex's downloaded app-server are no longer backed up.** `*.log` missed rotated and compressed logs (`codex-tui.log.2.gz` was 2.1 GB in one backup), and `~/.codex/packages/app-server-daemon/` holds the ~410 MB server binaries Codex downloads for each version. `*.log.<N>…` and `*.log.gz` are excluded at any depth, and `packages/app-server-daemon/` at the agent's root. Run `asb prune` to drop copies already in a backup.
 - **The cp fallbacks follow the same policy as rsync.** Backup without rsync now drops excluded paths at every depth, not just top-level names. Restore without rsync no longer deletes a top-level folder that holds excluded live data (it merged `antigravity-cli` away, losing conversations newer than the backup).
 - **The cp fallbacks never follow a symlink into live data.** With GNU `cp`, a symlinked `~/.gemini/antigravity-cli` was copied as a link, and removing its excluded `conversations/` and `brain/` then deleted the live ones it pointed to. Restore without rsync now also stages the backup before touching anything and refuses (exit 1) if staging fails, instead of restoring unfiltered.
 - **`asb diff` and restore previews match what a restore transfers.** They hid every directory named `conversations` or `brain`; only the excluded ones under `antigravity-cli/` are hidden now.
 - **One writer per backup.** backup, restore, import, tag and prune hold a kernel `flock` on the agent's backup (via `flock(1)` where installed, else perl), which the kernel releases when the holder exits or dies; a second writer waits up to `ASB_LOCK_WAIT` seconds (default 300). `prune --reinit` only replaces the refs it inspected and confirmed, and expires reflogs and garbage-collects only after every ref update succeeds.
 - **`asb verify` with no agent names checks every backup.** With two or more backups it reported "Unknown agent: claude cursor" and verified nothing (the names were sorted as one line).
+- **`prune` no longer races git's own maintenance.** Its commit could start a detached `git maintenance run --auto`, which repacked the old history while the `--reinit` garbage collection rewrote the same packs. The commit now runs with automatic maintenance off.
 - **The test suite no longer touches your crontab.** On a machine without systemd (macOS), every run of `tests/test_schedule.sh` replaced your real `ASB_BACKUP_SCHEDULE` cron entry with one that logs under a deleted temp directory, so the nightly backup failed. If you have run the tests, check `crontab -l`: if the entry's log path is under a temp directory, run `asb schedule --cron` again to restore it, or `asb schedule --remove --cron` to drop it.
 
 ### Added

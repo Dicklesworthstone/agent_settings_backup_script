@@ -22,6 +22,12 @@ add_codex_session_databases() {
     printf 'state\n' > "${codex}/state_5.sqlite"
     mkdir -p "${codex}/db-backups/sqlite-1"
     printf 'old\n' > "${codex}/db-backups/sqlite-1/logs_2.sqlite"
+    # Rotated logs and the app-server daemon Codex downloads for itself.
+    mkdir -p "${codex}/log" "${codex}/packages/app-server-daemon/releases/1.0/bin"
+    printf 'rotated\n' > "${codex}/log/codex-tui.log.2.gz"
+    printf 'rotated\n' > "${codex}/log/codex-tui.log.1"
+    printf 'binary\n' > "${codex}/packages/app-server-daemon/releases/1.0/bin/codex"
+    printf 'keep\n' > "${codex}/packages/notes.txt"
 }
 
 # Antigravity keeps conversations under ~/.gemini/antigravity-cli.
@@ -55,6 +61,10 @@ test_backup_excludes_codex_session_databases() {
     assert_file_not_exists "${mirror}/logs_2.sqlite" || return 1
     assert_file_not_exists "${mirror}/state_5.sqlite-wal" || return 1
     assert_dir_not_exists "${mirror}/db-backups" || return 1
+    assert_file_not_exists "${mirror}/log/codex-tui.log.2.gz" || return 1
+    assert_file_not_exists "${mirror}/log/codex-tui.log.1" || return 1
+    assert_dir_not_exists "${mirror}/packages/app-server-daemon" || return 1
+    assert_file_exists "${mirror}/packages/notes.txt" || return 1
 }
 
 test_backup_excludes_antigravity_transcripts() {
@@ -107,6 +117,8 @@ test_prune_removes_legacy_excluded_files() {
     local mirror="${ASB_BACKUP_ROOT}/.codex"
     commit_legacy_file "$mirror" "thread_history_1.sqlite"
     commit_legacy_file "$mirror" "sub/sessions/old.jsonl"
+    commit_legacy_file "$mirror" "log/codex-tui.log.2.gz"
+    commit_legacy_file "$mirror" "packages/app-server-daemon/releases/1.0/bin/codex"
     local commits_before
     commits_before=$(git -C "$mirror" rev-list --count HEAD)
 
@@ -116,7 +128,7 @@ test_prune_removes_legacy_excluded_files() {
     assert_file_not_exists "${mirror}/thread_history_1.sqlite" || return 1
     assert_dir_not_exists "${mirror}/sub/sessions" || return 1
     assert_file_exists "${mirror}/settings.json" || return 1
-    assert_equals "" "$(git -C "$mirror" ls-files -- thread_history_1.sqlite sub/sessions)" || return 1
+    assert_equals "" "$(git -C "$mirror" ls-files -- thread_history_1.sqlite sub/sessions log packages/app-server-daemon)" || return 1
     # A plain prune adds one commit and keeps history.
     assert_equals "$((commits_before + 1))" "$(git -C "$mirror" rev-list --count HEAD)" || return 1
 

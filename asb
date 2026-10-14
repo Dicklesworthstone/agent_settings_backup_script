@@ -45,7 +45,7 @@ export LC_ALL=C
 # VERSION
 #==============================================================================
 
-ASB_VERSION="0.3.2"
+ASB_VERSION="0.3.3"
 
 #==============================================================================
 # CONSTANTS
@@ -626,12 +626,14 @@ ASB_EXCLUDED_FILE_GLOBS=(
     '*.db-wal' '*.db-shm'
     'thread_history_*.sqlite'
     'logs_*.sqlite'
+    '*.log.[0-9]*' '*.log.gz'
 )
 
 # Directories excluded only at this path relative to the agent's root.
 ASB_EXCLUDED_NESTED=(
     antigravity-cli/conversations
     antigravity-cli/brain
+    packages/app-server-daemon
 )
 
 ASB_RSYNC_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
@@ -4300,8 +4302,11 @@ prune_agent() {
             PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"changed_since_inspection\",${fields}}"
             return 1
         fi
+        # No auto maintenance on this commit: a detached `git maintenance run
+        # --auto` would repack the old history while the reinit's gc does too.
         if ! git -C "$dest" rm -r -q --ignore-unmatch -- "${ASB_PRUNE_PATHSPECS[@]}" >/dev/null 2>&1 \
-            || ! git -C "$dest" commit -q -m "Prune ${agent_name}: remove ${count} path(s) excluded by the backup policy" >/dev/null 2>&1; then
+            || ! git -C "$dest" -c gc.auto=0 -c maintenance.auto=false \
+                commit -q -m "Prune ${agent_name}: remove ${count} path(s) excluded by the backup policy" >/dev/null 2>&1; then
             is_json_output || log_error "${agent_name}: failed to remove excluded paths"
             PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"remove_failed\",${fields}}"
             return 1
