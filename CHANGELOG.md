@@ -10,6 +10,12 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ---
 
+## [v0.3.6] — 2026-10-14
+
+### Fixed
+
+- **Installed npm packages and Codex's computer-use app are no longer backed up.** `~/.opencode/node_modules` (OpenCode's plugin SDK, 52 MB in 3,600 files) and Codex's `~/.codex/computer-use/Codex Computer Use.app` (73 MB) were re-committed whenever their tools updated. Now excluded: `node_modules/` at any depth (`package.json` and lock files stay, so `npm install` rebuilds it) and, for Codex, `computer-use/`. Restore never deletes them from the live folder. Run `asb prune` to drop copies already in a backup.
+
 ## [v0.3.5] — 2026-10-14
 
 ### Fixed

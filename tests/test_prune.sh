@@ -492,8 +492,9 @@ test_prune_unknown_option() {
 }
 
 # Top-level scratch and installer output: Gemini CLI's tmp/ (per-project chats),
-# Claude Code's jobs/, OpenCode's bin/. Same-named dirs deeper down, and
-# Claude's own bin/ (user scripts), are settings and stay.
+# Claude Code's jobs/, OpenCode's bin/, Codex's computer-use/ app bundle, and
+# node_modules/ at any depth. Same-named dirs deeper down, and Claude's own
+# bin/ (user scripts), are settings and stay.
 add_top_level_scratch() {
     create_mock_agent "gemini"
     mkdir -p "${HOME}/.gemini/tmp/proj/chats" "${HOME}/.gemini/skills/demo/tmp"
@@ -505,9 +506,18 @@ add_top_level_scratch() {
     printf 'binary\n' > "${HOME}/.claude/jobs/abc/tmp/am"
     printf '#!/bin/sh\n' > "${HOME}/.claude/bin/statusline.sh"
     printf 'keep\n' > "${HOME}/.claude/skills/demo/jobs/README.md"
+    mkdir -p "${HOME}/.claude/skills/demo/node_modules/dep"
+    printf 'dep\n' > "${HOME}/.claude/skills/demo/node_modules/dep/index.js"
+    printf '{}\n' > "${HOME}/.claude/skills/demo/package.json"
     create_mock_agent "opencode"
-    mkdir -p "${HOME}/.opencode/bin"
+    mkdir -p "${HOME}/.opencode/bin" "${HOME}/.opencode/node_modules/@opencode-ai/plugin"
     printf 'binary\n' > "${HOME}/.opencode/bin/opencode"
+    printf 'sdk\n' > "${HOME}/.opencode/node_modules/@opencode-ai/plugin/index.js"
+    printf '{}\n' > "${HOME}/.opencode/package.json"
+    create_codex_fixture
+    mkdir -p "${HOME}/.codex/computer-use/Codex Computer Use.app/Contents" "${HOME}/.codex/skills/demo/computer-use"
+    printf 'plist\n' > "${HOME}/.codex/computer-use/Codex Computer Use.app/Contents/Info.plist"
+    printf 'keep\n' > "${HOME}/.codex/skills/demo/computer-use/notes.md"
 }
 
 assert_top_level_scratch_excluded() {
@@ -519,12 +529,18 @@ assert_top_level_scratch_excluded() {
     assert_file_exists "${b}/.claude/bin/statusline.sh" || return 1
     assert_file_exists "${b}/.claude/skills/demo/jobs/README.md" || return 1
     assert_dir_not_exists "${b}/.opencode/bin" || return 1
+    assert_dir_not_exists "${b}/.opencode/node_modules" || return 1
+    assert_file_exists "${b}/.opencode/package.json" || return 1
     assert_file_exists "${b}/.opencode/settings.json" || return 1
+    assert_dir_not_exists "${b}/.claude/skills/demo/node_modules" || return 1
+    assert_file_exists "${b}/.claude/skills/demo/package.json" || return 1
+    assert_dir_not_exists "${b}/.codex/computer-use" || return 1
+    assert_file_exists "${b}/.codex/skills/demo/computer-use/notes.md" || return 1
 }
 
 test_backup_excludes_top_level_scratch() {
     add_top_level_scratch
-    run_asb backup gemini claude opencode
+    run_asb backup gemini claude opencode codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
     assert_top_level_scratch_excluded
 }
@@ -532,7 +548,7 @@ test_backup_excludes_top_level_scratch() {
 test_cp_fallback_backup_excludes_top_level_scratch() {
     add_top_level_scratch
     use_failing_rsync
-    run_asb backup gemini claude opencode
+    run_asb backup gemini claude opencode codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
     assert_top_level_scratch_excluded
 }
@@ -555,6 +571,7 @@ restore_keeps_live_top_level_scratch() {
     assert_not_contains "$(cat "${HOME}/.opencode/settings.json")" "changed" || return 1
     assert_file_exists "${HOME}/.gemini/tmp/proj/chats/session-1.jsonl" || return 1
     assert_file_exists "${HOME}/.opencode/bin/opencode" || return 1
+    assert_file_exists "${HOME}/.opencode/node_modules/@opencode-ai/plugin/index.js" || return 1
 }
 
 test_restore_keeps_live_top_level_scratch() {
@@ -581,15 +598,20 @@ test_diff_ignores_top_level_scratch() {
 
 test_prune_removes_legacy_top_level_scratch() {
     add_top_level_scratch
-    run_asb backup claude opencode
+    run_asb backup claude opencode codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
     commit_legacy_file "${ASB_BACKUP_ROOT}/.opencode" "bin/opencode"
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.opencode" "node_modules/@opencode-ai/plugin/index.js"
     commit_legacy_file "${ASB_BACKUP_ROOT}/.claude" "jobs/abc/tmp/am"
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.claude" "skills/demo/node_modules/dep/index.js"
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.codex" "computer-use/Codex Computer Use.app/Contents/Info.plist"
 
-    run_asb prune opencode claude --force
+    run_asb prune opencode claude codex --force
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
-    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.opencode" ls-files -- bin)" || return 1
-    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.claude" ls-files -- jobs)" || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.opencode" ls-files -- bin node_modules)" || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.claude" ls-files -- jobs skills/demo/node_modules)" || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.codex" ls-files -- computer-use)" || return 1
+    assert_equals "skills/demo/computer-use/notes.md" "$(git -C "${ASB_BACKUP_ROOT}/.codex" ls-files -- skills/demo/computer-use)" || return 1
     # Per-agent: Claude's bin/ is not OpenCode's.
     assert_equals "bin/statusline.sh" "$(git -C "${ASB_BACKUP_ROOT}/.claude" ls-files -- bin)" || return 1
 }

@@ -60,7 +60,7 @@ export LC_ALL=C
 # VERSION
 #==============================================================================
 
-ASB_VERSION="0.3.5"
+ASB_VERSION="0.3.6"
 
 #==============================================================================
 # CONSTANTS
@@ -626,11 +626,13 @@ create_backup_commit() {
 # same rules apply on restore so that `rsync --delete` never removes live data
 # that is (by design) absent from the backup.
 
-# Directory names excluded at any depth.
+# Directory names excluded at any depth. node_modules is installer output
+# (OpenCode's plugin SDK, a skill's npm deps); package.json stays, so an
+# `npm install` rebuilds it.
 ASB_EXCLUDED_DIRS=(
     cache Cache .cache
     sessions archived_sessions file-history projects downloads shell-snapshots
-    db-backups
+    db-backups node_modules
 )
 
 # File-name globs excluded at any depth.
@@ -658,11 +660,13 @@ ASB_EXCLUDED_NESTED_ALL=(
 # Root-relative exclusions for one agent only (space-separated). bin/ is
 # installer output in OpenCode (its 185 MB CLI) and Factory (a bundled rg);
 # a rule for every agent would also drop scripts users keep in ~/.claude/bin.
-# Claude Code's jobs/ holds background-job state and scratch builds.
+# Claude Code's jobs/ holds background-job state and scratch builds. Codex's
+# computer-use/ holds the macOS app bundle it downloads (73 MB) and UI strings.
 declare -A ASB_AGENT_EXCLUDED_NESTED=(
     [opencode]="bin"
     [factory]="bin"
     [claude]="jobs"
+    [codex]="computer-use"
 )
 
 ASB_RSYNC_EXCLUDES_BASE=(--exclude='.git' --exclude='.gitignore')

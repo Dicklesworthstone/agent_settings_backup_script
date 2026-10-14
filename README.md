@@ -72,7 +72,7 @@ cp asb ~/.local/bin/
 **Verify installation:**
 
 ```bash
-asb version   # Should output: asb version 0.3.5
+asb version   # Should output: asb version 0.3.6
 asb help      # Shows available commands
 ```
 
@@ -597,7 +597,7 @@ A: No. asb falls back to `cp` if rsync isn't available, though rsync provides mo
 A: Use `asb export <agent> backup.tar.gz` on the source machine, copy the file, then `asb import backup.tar.gz` on the destination.
 
 **Q: What files are excluded from backups?**
-A: asb backs up settings, not session data. Excluded everywhere: logs (`*.log`, rotated `*.log.1`… and `*.log.gz`), caches (`cache/`, `Cache/`, `.cache/`), session transcripts and edit history (`sessions/`, `archived_sessions/`, `file-history/`, `projects/`, `downloads/`, `shell-snapshots/`), SQLite write-ahead sidecars (`*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite3-wal`, `*.sqlite3-shm`, `*.db-wal`, `*.db-shm`), and Codex's session databases (`thread_history_*.sqlite`, `logs_*.sqlite`, `db-backups/`). Excluded only at the top of an agent's folder: `tmp/` (Gemini CLI keeps per-project chats and logs there), Antigravity's `antigravity-cli/conversations/` and `antigravity-cli/brain/` under `~/.gemini`, and the server binaries Codex downloads for itself (`packages/app-server-daemon/`, `plugins/.plugin-appserver/`). Per agent: OpenCode's and Factory's `bin/` (their own installed binaries) and Claude Code's `jobs/` (background-job state and scratch). A `bin/` you keep in `~/.claude` is still backed up. Restore never deletes any of these from the live folder.
+A: asb backs up settings, not session data. Excluded everywhere: logs (`*.log`, rotated `*.log.1`… and `*.log.gz`), caches (`cache/`, `Cache/`, `.cache/`), session transcripts and edit history (`sessions/`, `archived_sessions/`, `file-history/`, `projects/`, `downloads/`, `shell-snapshots/`), SQLite write-ahead sidecars (`*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite3-wal`, `*.sqlite3-shm`, `*.db-wal`, `*.db-shm`), Codex's session databases (`thread_history_*.sqlite`, `logs_*.sqlite`, `db-backups/`), and `node_modules/` (installed npm packages; `package.json` is kept). Excluded only at the top of an agent's folder: `tmp/` (Gemini CLI keeps per-project chats and logs there), Antigravity's `antigravity-cli/conversations/` and `antigravity-cli/brain/` under `~/.gemini`, and the server binaries Codex downloads for itself (`packages/app-server-daemon/`, `plugins/.plugin-appserver/`). Per agent: OpenCode's and Factory's `bin/` (their own installed binaries), Claude Code's `jobs/` (background-job state and scratch), and Codex's `computer-use/` (the macOS app it downloads). A `bin/` you keep in `~/.claude` is still backed up. Restore never deletes any of these from the live folder.
 
 **Q: My backup folder is huge. How do I shrink it?**
 A: Backups made before an exclusion existed still contain that data, and every earlier commit keeps its copies (re-committing a multi-GB database every night grows `.git` by gigabytes). `asb prune <agent> --dry-run` shows what the current policy excludes; `asb prune <agent>` removes it in a new commit, which stops it being carried forward. To actually free the space, `asb prune <agent> --reinit` also resets that backup's history to a single commit and garbage-collects. That drops every earlier commit and tag, so `asb export` first if you need them. Both steps ask for confirmation unless you pass `--force`.
