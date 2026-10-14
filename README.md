@@ -72,7 +72,7 @@ cp asb ~/.local/bin/
 **Verify installation:**
 
 ```bash
-asb version   # Should output: asb version 0.3.4
+asb version   # Should output: asb version 0.3.5
 asb help      # Shows available commands
 ```
 
@@ -572,7 +572,7 @@ asb --dry-run restore claude
 
 ## Requirements
 
-- Bash 4 or later on `PATH` (required)
+- Bash 4 or later (required). On macOS install it with `brew install bash`; asb finds it even when cron or launchd start it with the system Bash 3.2.
 - `git` (required)
 - `rsync` (recommended, falls back to `cp`)
 - `curl` or `wget` (for installation)

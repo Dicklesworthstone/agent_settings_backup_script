@@ -10,6 +10,14 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ---
 
+## [v0.3.5] — 2026-10-14
+
+### Fixed
+
+- **Scheduled backups now run on macOS.** cron and launchd start jobs with `PATH=/usr/bin:/bin`, where `#!/usr/bin/env bash` finds the system Bash 3.2. asb stopped at its first associative array (`line 75: claude: unbound variable`) and still exited 0, so the nightly cron entry silently backed up nothing. asb now re-execs under a Bash 4+ it finds (Homebrew's `/opt/homebrew/bin/bash` or `/usr/local/bin/bash`, Linuxbrew, or another `bash` on `PATH`), and exits 1 with an install hint when there is none. Existing cron entries start working once asb is upgraded.
+
+---
+
 ## [v0.3.4] — 2026-10-14
 
 ### Fixed

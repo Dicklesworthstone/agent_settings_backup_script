@@ -38,6 +38,21 @@
 #
 #==============================================================================
 
+# Bash 4+ is required (associative arrays). cron and launchd start jobs with
+# PATH=/usr/bin:/bin, where `env bash` is macOS's Bash 3.2, so re-exec under a
+# newer installed bash instead of dying on the first `declare -A`. Keep this
+# block Bash 3.2-compatible.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    for asb_bash in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash $(type -ap bash 2>/dev/null); do
+        [ -x "$asb_bash" ] && [ "$asb_bash" != "${BASH:-}" ] || continue
+        if [ "$("$asb_bash" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+            exec "$asb_bash" "$0" "$@"
+        fi
+    done
+    echo "asb: Bash 4 or later is required (this is ${BASH_VERSION:-an unknown shell}); install one, e.g. 'brew install bash'" >&2
+    exit 1
+fi
+
 set -uo pipefail
 export LC_ALL=C
 
@@ -45,7 +60,7 @@ export LC_ALL=C
 # VERSION
 #==============================================================================
 
-ASB_VERSION="0.3.4"
+ASB_VERSION="0.3.5"
 
 #==============================================================================
 # CONSTANTS

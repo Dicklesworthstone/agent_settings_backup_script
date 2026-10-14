@@ -230,8 +230,28 @@ test_schedule_status_both_modes() {
     assert_exit_code 0 "$ASB_LAST_STATUS"
 }
 
+# cron and launchd run jobs with PATH=/usr/bin:/bin. On macOS that makes
+# `env bash` the system Bash 3.2, which cannot run asb directly; asb must
+# re-exec under a newer bash and complete a real backup.
+test_backup_from_cron_environment() {
+    local old_major
+    old_major=$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null) || old_major=0
+    if [[ "$old_major" -ge 4 ]]; then
+        skip_test "/bin/bash is ${old_major}.x here; the pre-4 path needs macOS"
+        return 2
+    fi
+    create_claude_fixture
+    local out status=0
+    out=$(env -i HOME="$HOME" ASB_BACKUP_ROOT="$ASB_BACKUP_ROOT" XDG_STATE_HOME="$XDG_STATE_HOME" \
+        PATH=/usr/bin:/bin /bin/bash "${REPO_ROOT}/asb" backup claude 2>&1) || status=$?
+    assert_exit_code 0 "$status" || { echo "$out" >&2; return 1; }
+    assert_file_exists "${ASB_BACKUP_ROOT}/.claude/settings.json" || return 1
+    assert_contains "$(git -C "${ASB_BACKUP_ROOT}/.claude" log -1 --format=%s)" "Backup Claude Code" || return 1
+}
+
 # Run all tests
 run_test "schedule_help" test_schedule_help || true
+run_test "backup_from_cron_environment" test_backup_from_cron_environment || true
 run_test "schedule_no_mode" test_schedule_no_mode || true
 run_test "schedule_cron_install_and_remove" test_schedule_cron_install_and_remove || true
 run_test "schedule_unknown_option" test_schedule_unknown_option || true
