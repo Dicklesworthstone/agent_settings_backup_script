@@ -40,9 +40,7 @@ test_verify_no_backup() {
     # Should fail or warn
     if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
         # If it passes, output should indicate no backup
-        assert_contains "$ASB_LAST_OUTPUT" "no backup" || \
-        assert_contains "$ASB_LAST_OUTPUT" "not found" || \
-        return 1
+        assert_contains "$ASB_LAST_OUTPUT" "No backup found" || return 1
     fi
 }
 

@@ -14,7 +14,8 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 - **The cp fallbacks follow the same policy as rsync.** Backup without rsync now drops excluded paths at every depth, not just top-level names. Restore without rsync no longer deletes a top-level folder that holds excluded live data (it merged `antigravity-cli` away, losing conversations newer than the backup).
 - **The cp fallbacks never follow a symlink into live data.** With GNU `cp`, a symlinked `~/.gemini/antigravity-cli` was copied as a link, and removing its excluded `conversations/` and `brain/` then deleted the live ones it pointed to. Restore without rsync now also stages the backup before touching anything and refuses (exit 1) if staging fails, instead of restoring unfiltered.
 - **`asb diff` and restore previews match what a restore transfers.** They hid every directory named `conversations` or `brain`; only the excluded ones under `antigravity-cli/` are hidden now.
-- **One writer per backup.** backup, restore, import, tag and prune lock the agent's backup; a second writer waits up to `ASB_LOCK_WAIT` seconds (default 300). `prune --reinit` only replaces the refs it inspected and confirmed, and expires reflogs and garbage-collects only after every ref update succeeds.
+- **One writer per backup.** backup, restore, import, tag and prune hold a kernel `flock` on the agent's backup (via `flock(1)` where installed, else perl), which the kernel releases when the holder exits or dies; a second writer waits up to `ASB_LOCK_WAIT` seconds (default 300). `prune --reinit` only replaces the refs it inspected and confirmed, and expires reflogs and garbage-collects only after every ref update succeeds.
+- **`asb verify` with no agent names checks every backup.** With two or more backups it reported "Unknown agent: claude cursor" and verified nothing (the names were sorted as one line).
 
 ### Added
 

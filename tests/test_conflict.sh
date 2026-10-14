@@ -39,27 +39,9 @@ setup_restore_conflict() {
 
     local source_dir="${HOME}/.claude"
     printf "changed\n" >> "$source_dir/settings.json"
-    rm -f "$source_dir/projects/recent.json"
+    # extensions/ is backed up; projects/ is excluded and never restored.
+    rm -f "$source_dir/extensions/list.txt"
     printf "current-only\n" > "$source_dir/current_only.txt"
-}
-
-run_asb_tty() {
-    local input="$1"
-    shift
-
-    skip_if_missing script "script command not available for TTY tests" || return 2
-
-    if script -q -e -c true /dev/null >/dev/null 2>&1; then
-        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -e -c "$ASB_BIN $*" /dev/null 2>&1)
-        ASB_LAST_STATUS=$?
-    else
-        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -c "$ASB_BIN $*" /dev/null 2>&1)
-        ASB_LAST_STATUS=$?
-        if [[ $ASB_LAST_STATUS -eq 0 ]] && [[ "$ASB_LAST_OUTPUT" == *"Restore cancelled"* ]]; then
-            ASB_LAST_STATUS=1
-        fi
-    fi
-    return $ASB_LAST_STATUS
 }
 
 test_restore_shows_preview() {
@@ -71,9 +53,9 @@ test_restore_shows_preview() {
         echo "Expected restore to cancel with 'n' input" >&2
         return 1
     fi
-    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be DELETED"
-    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be ADDED"
-    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be REPLACED"
+    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be DELETED" || return 1
+    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be ADDED" || return 1
+    assert_output_contains_ctx "$ASB_LAST_OUTPUT" "will be REPLACED" || return 1
 }
 
 test_restore_requires_confirmation() {
@@ -109,9 +91,11 @@ test_restore_confirm_yes() {
 
     local source_dir="${HOME}/.claude"
     local backup_dir="${ASB_BACKUP_ROOT}/.claude"
+    # projects/ is excluded from backups, so restore leaves the live one alone.
     if ! diff -rq "$backup_dir" "$source_dir" \
         --exclude='.git' \
-        --exclude='.gitignore' >/dev/null 2>&1; then
+        --exclude='.gitignore' \
+        --exclude='projects' >/dev/null 2>&1; then
         diff -ru "$backup_dir" "$source_dir" >&2 || true
         return 1
     fi
@@ -148,9 +132,11 @@ test_force_skips_confirmation() {
 
     local source_dir="${HOME}/.claude"
     local backup_dir="${ASB_BACKUP_ROOT}/.claude"
+    # projects/ is excluded from backups, so restore leaves the live one alone.
     if ! diff -rq "$backup_dir" "$source_dir" \
         --exclude='.git' \
-        --exclude='.gitignore' >/dev/null 2>&1; then
+        --exclude='.gitignore' \
+        --exclude='projects' >/dev/null 2>&1; then
         diff -ru "$backup_dir" "$source_dir" >&2 || true
         return 1
     fi
@@ -194,7 +180,7 @@ test_preview_formatting() {
     local paths=()
     while IFS= read -r line; do
         case "$line" in
-            *"will be DELETED"*|*"will be ADDED"*|*"will be REPLACED"*)
+            *"(will be DELETED)"*|*"(will be ADDED)"*|*"(will be REPLACED)"*)
                 local cleaned
                 cleaned=$(echo "$line" | sed -E 's/\x1B\[[0-9;]*[mK]//g')
                 cleaned=${cleaned%%(will be *}

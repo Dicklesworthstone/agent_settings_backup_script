@@ -135,6 +135,37 @@ run_asb() {
     return $ASB_LAST_STATUS
 }
 
+# Run asb on a pseudo-terminal, typing $1 (printf %b escapes) as input.
+# util-linux and BSD script(1) take different arguments. BSD script sends EOF
+# as soon as its input closes, ahead of text the command has not read yet, so
+# the input stays open until the command has finished.
+run_asb_tty() {
+    local input="$1"
+    shift
+
+    skip_if_missing script "script command not available for TTY tests" || return 2
+
+    # Probes read /dev/null: BSD script fails when its stdin is a socket.
+    if script -q -e -c true /dev/null </dev/null >/dev/null 2>&1; then
+        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -e -c "$ASB_BIN $*" /dev/null 2>&1)
+        ASB_LAST_STATUS=$?
+    elif script -q /dev/null true </dev/null >/dev/null 2>&1; then
+        local done_mark="${TEST_ENV_ROOT}/tty-done.$RANDOM"
+        ASB_LAST_OUTPUT=$( { printf '%b' "$input"
+            for _ in $(seq 1 600); do [[ -e "$done_mark" ]] && break; sleep 0.1; done
+        } | { script -q /dev/null "$ASB_BIN" "$@" 2>&1; st=$?; : > "$done_mark"; exit "$st"; } )
+        ASB_LAST_STATUS=$?
+    else
+        # util-linux without -e does not pass the exit status through.
+        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -c "$ASB_BIN $*" /dev/null 2>&1)
+        ASB_LAST_STATUS=$?
+        if [[ $ASB_LAST_STATUS -eq 0 ]] && [[ "$ASB_LAST_OUTPUT" == *"cancelled"* ]]; then
+            ASB_LAST_STATUS=1
+        fi
+    fi
+    return $ASB_LAST_STATUS
+}
+
 get_dir_checksum() {
     local dir="$1"
     if [[ ! -d "$dir" ]]; then

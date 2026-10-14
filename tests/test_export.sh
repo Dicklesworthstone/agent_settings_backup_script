@@ -12,25 +12,6 @@ source "${LIB_DIR}/fixtures.sh"
 
 declare -F create_claude_fixture >/dev/null 2>&1 || { echo "create_claude_fixture not loaded" >&2; exit 1; }
 
-run_asb_tty() {
-    local input="$1"
-    shift
-
-    skip_if_missing script "script command not available for TTY tests" || return 2
-
-    if script -q -e -c true /dev/null >/dev/null 2>&1; then
-        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -e -c "$ASB_BIN $*" /dev/null 2>&1)
-        ASB_LAST_STATUS=$?
-    else
-        ASB_LAST_OUTPUT=$(printf '%b' "$input" | script -q -c "$ASB_BIN $*" /dev/null 2>&1)
-        ASB_LAST_STATUS=$?
-        if [[ $ASB_LAST_STATUS -eq 0 ]] && [[ "$ASB_LAST_OUTPUT" == *"Import cancelled"* ]]; then
-            ASB_LAST_STATUS=1
-        fi
-    fi
-    return $ASB_LAST_STATUS
-}
-
 make_backup_with_history() {
     create_claude_fixture
     run_asb backup claude

@@ -33,8 +33,8 @@ test_large_file_1mb() {
     fi
 
     local original_size backed_up_size
-    original_size=$(stat -c%s "${HOME}/.claude/large_1mb.bin")
-    backed_up_size=$(stat -c%s "${ASB_BACKUP_ROOT}/.claude/large_1mb.bin")
+    original_size=$(wc -c < "${HOME}/.claude/large_1mb.bin" | tr -d " ")
+    backed_up_size=$(wc -c < "${ASB_BACKUP_ROOT}/.claude/large_1mb.bin" | tr -d " ")
 
     if [[ "$original_size" -ne "$backed_up_size" ]]; then
         echo "Size mismatch: original=$original_size backed_up=$backed_up_size" >&2
@@ -201,15 +201,15 @@ test_export_large_file() {
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     local export_file="${TEST_ENV_ROOT}/large_export.tar.gz"
-    run_asb export claude -o "$export_file"
+    run_asb export claude "$export_file"
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     assert_file_exists "$export_file" || return 1
 
     # Archive should be smaller due to compression
     local bin_size archive_size
-    bin_size=$(stat -c%s "${HOME}/.claude/export_large.bin")
-    archive_size=$(stat -c%s "$export_file")
+    bin_size=$(wc -c < "${HOME}/.claude/export_large.bin" | tr -d " ")
+    archive_size=$(wc -c < "$export_file" | tr -d " ")
 
     echo "Original: $bin_size bytes, Archive: $archive_size bytes"
 }
@@ -219,27 +219,27 @@ test_import_large_file() {
 
     dd if=/dev/urandom of="${HOME}/.claude/import_test.bin" bs=1024 count=3072 2>/dev/null
     local checksum_original
-    checksum_original=$(md5sum "${HOME}/.claude/import_test.bin" | cut -d' ' -f1)
+    checksum_original=$(cksum < "${HOME}/.claude/import_test.bin")
 
     run_asb backup claude
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
     local export_file="${TEST_ENV_ROOT}/import_test.tar.gz"
-    run_asb export claude -o "$export_file"
+    run_asb export claude "$export_file"
     assert_exit_code 0 "$ASB_LAST_STATUS"
 
-    # Clear backup
-    rm -rf "${ASB_BACKUP_ROOT}/.claude"
-
-    # Import
+    # Import into an empty backup location
+    export ASB_BACKUP_ROOT="${TEST_ENV_ROOT}/imported"
+    mkdir -p "$ASB_BACKUP_ROOT"
     run_asb import "$export_file"
-    assert_exit_code 0 "$ASB_LAST_STATUS"
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
 
     # Verify content
     if [[ ! -f "${ASB_BACKUP_ROOT}/.claude/import_test.bin" ]]; then
         echo "Large file not imported" >&2
         return 1
     fi
+    assert_equals "$checksum_original" "$(cksum < "${ASB_BACKUP_ROOT}/.claude/import_test.bin")" || return 1
 }
 
 # ============================================

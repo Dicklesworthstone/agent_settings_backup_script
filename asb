@@ -193,74 +193,75 @@ get_agent_backup_dir() {
 # Backups are git repos; one asb writer per repo at a time. A scheduled
 # backup committing while `asb prune --reinit` rewrites history and runs
 # `gc --prune=now` can lose the objects it just wrote, and two restores or
-# imports would interleave. mkdir is atomic everywhere asb runs (flock is not
-# on macOS). A second writer waits up to ASB_LOCK_WAIT seconds (default 300).
-# Hooks are child processes and inherit ASB_LOCK_OWNER, so asb called from a
-# hook does not wait on its parent.
-ASB_HELD_LOCKS=()
+# imports would interleave. The lock is a kernel flock(2) on
+# <backup_root>/.asb-locks/<folder>.flock, taken on file descriptor 8 of this
+# shell (by flock(1) where installed, else perl): the kernel drops it when the
+# holder exits or dies, so there is no stale lock to take over and nothing to
+# remove on unlock. A second writer waits up to ASB_LOCK_WAIT seconds (default
+# 300). Hooks are child processes and inherit ASB_LOCKED_FOLDERS, so asb
+# called from a hook does not wait on its parent.
+ASB_LOCK_HELD=""
 
 asb_backup_lock_path() {
     local folder="${1//\//__}"
-    echo "$(get_backup_root)/.asb-locks/${folder#.}.lock"
+    echo "$(get_backup_root)/.asb-locks/${folder#.}.flock"
 }
 
-asb_lock_backup() {
-    local folder="$1" lock pid waited=0 wait_max="${ASB_LOCK_WAIT:-300}"
-    lock=$(asb_backup_lock_path "$folder")
-    if [[ -n "${ASB_LOCK_OWNER:-}" && "$(cat "$lock/pid" 2>/dev/null)" == "$ASB_LOCK_OWNER" ]]; then
-        return 0
+# Try once to take an exclusive flock on fd 8, without blocking.
+asb_flock_fd8() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -n -x 8
+    else
+        perl -e 'use Fcntl qw(:flock); open(my $fh, ">&=", 8) or exit 2; flock($fh, LOCK_EX | LOCK_NB) or exit 1'
     fi
+}
+
+# Lock one backup folder. Returns 0 holding it; ASB_LOCK_ACQUIRED says whether
+# this call took it (false when an ancestor asb already holds it).
+asb_lock_backup() {
+    local folder="$1" lock waited=0 wait_max="${ASB_LOCK_WAIT:-300}"
+    ASB_LOCK_ACQUIRED=false
+    case " ${ASB_LOCKED_FOLDERS:-} " in
+        *" ${folder} "*) return 0 ;;
+    esac
+    if [[ -n "$ASB_LOCK_HELD" ]]; then
+        log_error "Internal error: already holding the ${ASB_LOCK_HELD} lock"
+        return 1
+    fi
+    lock=$(asb_backup_lock_path "$folder")
     mkdir -p "${lock%/*}" 2>/dev/null
-    until mkdir "$lock" 2>/dev/null; do
-        pid=$(cat "$lock/pid" 2>/dev/null || true)
-        # Dead owner, or an empty lock that was never finished: take it over.
-        if { [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; } \
-            || { [[ -z "$pid" ]] && [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; }; then
-            rm -rf "$lock" 2>/dev/null
-            if [[ -e "$lock" ]]; then
-                log_error "Cannot remove stale lock ${lock}"
-                return 1
-            fi
-            continue
-        fi
+    if ! exec 8>>"$lock"; then
+        log_error "Cannot open lock file ${lock}"
+        return 1
+    fi
+    until asb_flock_fd8; do
         if (( waited >= wait_max )); then
-            log_error "Another asb operation${pid:+ (pid ${pid})} is still writing to the ${folder} backup; try again when it finishes"
+            exec 8>&-
+            log_error "Another asb operation is still writing to the ${folder} backup; try again when it finishes"
             return 1
         fi
-        (( waited == 0 )) && log_info "Waiting for asb${pid:+ pid ${pid}} to finish with the ${folder} backup..."
+        (( waited == 0 )) && log_info "Waiting for another asb to finish with the ${folder} backup..."
         sleep 1
         waited=$((waited + 1))
     done
-    printf '%s\n' "$$" > "$lock/pid"
-    ASB_HELD_LOCKS+=("$lock")
-    export ASB_LOCK_OWNER="$$"
-    trap asb_release_locks EXIT
+    ASB_LOCK_HELD="$folder"
+    ASB_LOCK_ACQUIRED=true
+    export ASB_LOCKED_FOLDERS="${ASB_LOCKED_FOLDERS:-} ${folder}"
 }
 
 asb_unlock_backup() {
-    local lock i
-    lock=$(asb_backup_lock_path "$1")
-    for i in ${ASB_HELD_LOCKS[@]+"${!ASB_HELD_LOCKS[@]}"}; do
-        if [[ "${ASB_HELD_LOCKS[$i]}" == "$lock" ]]; then
-            rm -rf "$lock" 2>/dev/null
-            unset 'ASB_HELD_LOCKS[i]'
-        fi
-    done
-    return 0
-}
-
-asb_release_locks() {
-    local lock
-    for lock in ${ASB_HELD_LOCKS[@]+"${ASB_HELD_LOCKS[@]}"}; do
-        [[ "$(cat "$lock/pid" 2>/dev/null)" == "$$" ]] && rm -rf "$lock" 2>/dev/null
-    done
-    ASB_HELD_LOCKS=()
+    [[ -n "$ASB_LOCK_HELD" && "$ASB_LOCK_HELD" == "$1" ]] || return 0
+    exec 8>&-
+    ASB_LOCK_HELD=""
+    ASB_LOCKED_FOLDERS=" ${ASB_LOCKED_FOLDERS:-} "
+    ASB_LOCKED_FOLDERS="${ASB_LOCKED_FOLDERS// $1 / }"
+    export ASB_LOCKED_FOLDERS
     return 0
 }
 
 # Run "$@" holding the lock on one agent's backup. Dry runs need none.
 with_backup_lock() {
-    local agent="$1" folder="" rc=0
+    local agent="$1" folder="" rc=0 acquired
     shift
     [[ -n "$agent" ]] && folder="${AGENT_FOLDERS[$agent]:-}"
     if is_dry_run || [[ -z "$folder" ]]; then
@@ -268,8 +269,9 @@ with_backup_lock() {
         return
     fi
     asb_lock_backup "$folder" || return 1
+    acquired="$ASB_LOCK_ACQUIRED"
     "$@" || rc=$?
-    asb_unlock_backup "$folder"
+    [[ "$acquired" == "true" ]] && asb_unlock_backup "$folder"
     return "$rc"
 }
 
@@ -1561,7 +1563,7 @@ import_backup() {
     # Create backup location if needed
     mkdir -p "$backup_root"
 
-    # Held until exit (asb_release_locks).
+    # Held until asb exits.
     if [[ -n "$agent_folder" ]] && ! asb_lock_backup "$agent_folder"; then
         is_json_output && json_output "{\"status\":\"error\",\"error\":\"locked\"}"
         return 1
@@ -2942,7 +2944,7 @@ verify_all_json() {
     fi
 
     # Sort agents for consistent output
-    mapfile -t agents < <(sort <<<"${agents[*]}")
+    mapfile -t agents < <(printf '%s\n' "${agents[@]}" | sort)
 
     for agent in "${agents[@]}"; do
         if ! agent_exists "$agent"; then
@@ -3082,7 +3084,7 @@ verify_all() {
     fi
 
     # Sort agents for consistent output
-    mapfile -t agents < <(sort <<<"${agents[*]}")
+    mapfile -t agents < <(printf '%s\n' "${agents[@]}" | sort)
 
     for agent in "${agents[@]}"; do
         if ! agent_exists "$agent"; then

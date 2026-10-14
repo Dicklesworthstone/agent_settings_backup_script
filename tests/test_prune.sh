@@ -362,18 +362,32 @@ EOF
     assert_contains "$(git -C "$mirror" log --format=%s)" "legacy backup with thread_history_1.sqlite" || return 1
 }
 
+# Hold the codex backup lock from another process for $1 seconds.
+# Sets LOCK_HOLDER_PID; returns once the lock is held.
+hold_codex_lock() {
+    local lock="${ASB_BACKUP_ROOT}/.asb-locks/codex.flock" ready="${TEST_ENV_ROOT}/lock-ready.$RANDOM"
+    mkdir -p "${lock%/*}"
+    perl -e 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die;
+             open(my $r, ">", $ARGV[1]) or die; close $r; sleep $ARGV[2]' "$lock" "$ready" "$1" &
+    LOCK_HOLDER_PID=$!
+    local i
+    for i in $(seq 1 100); do
+        [[ -e "$ready" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 test_write_commands_refuse_while_locked() {
     create_codex_fixture
     run_asb backup codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
-    # A live asb (this test shell) is writing the codex backup.
-    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
-    printf '%s\n' "$$" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+    hold_codex_lock 60 || return 1
     export ASB_LOCK_WAIT=0
 
     run_asb backup codex
     assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
-    assert_contains "$ASB_LAST_OUTPUT" "Another asb operation (pid $$)" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Another asb operation is still writing" || return 1
     run_asb --force prune codex --reinit
     assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
     run_asb restore codex --force
@@ -386,31 +400,61 @@ test_write_commands_refuse_while_locked() {
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
     run_asb --dry-run prune codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    kill "$LOCK_HOLDER_PID" 2>/dev/null
+    wait "$LOCK_HOLDER_PID" 2>/dev/null || true
 }
 
 test_writer_waits_for_lock_holder() {
     create_codex_fixture
-    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
-    sleep 2 &
-    local holder=$!
-    printf '%s\n' "$holder" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+    hold_codex_lock 2 || return 1
     export ASB_LOCK_WAIT=30
 
     run_asb backup codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
-    assert_contains "$ASB_LAST_OUTPUT" "Waiting for asb pid ${holder}" || return 1
-    assert_dir_not_exists "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Waiting for another asb" || return 1
 }
 
-test_stale_write_lock_is_taken_over() {
+test_lock_dies_with_its_holder() {
     create_codex_fixture
-    mkdir -p "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock"
-    # A pid that cannot be running.
-    printf '%s\n' "999999999" > "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock/pid"
+    hold_codex_lock 60 || return 1
+    kill -9 "$LOCK_HOLDER_PID"
+    wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+    export ASB_LOCK_WAIT=0
 
+    # The lock file is still there, but nobody holds it: no takeover needed.
+    assert_file_exists "${ASB_BACKUP_ROOT}/.asb-locks/codex.flock" || return 1
     run_asb backup codex
     assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
-    assert_dir_not_exists "${ASB_BACKUP_ROOT}/.asb-locks/codex.lock" || return 1
+}
+
+test_simultaneous_writers_never_overlap() {
+    create_codex_fixture
+    # Start from a lock file whose holder was killed: the case where
+    # stale-lock takeover could let two claimants in together.
+    hold_codex_lock 60 || return 1
+    kill -9 "$LOCK_HOLDER_PID"
+    wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+
+    local log="${TEST_ENV_ROOT}/overlap.log" mark="${TEST_ENV_ROOT}/inside"
+    local hook="${XDG_CONFIG_HOME}/asb/hooks/pre-backup.d/10-overlap.sh"
+    mkdir -p "${hook%/*}"
+    printf '#!/bin/sh\nmkdir "%s" 2>/dev/null || echo overlap >> "%s"\necho enter >> "%s"\nsleep 1\nrmdir "%s" 2>/dev/null\nexit 0\n' \
+        "$mark" "$log" "$log" "$mark" > "$hook"
+    chmod +x "$hook"
+    export ASB_LOCK_WAIT=60
+
+    local -a pids=()
+    local i failed=0
+    for i in 1 2 3 4; do
+        "$ASB_BIN" backup codex >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+    for i in "${pids[@]}"; do
+        wait "$i" || failed=$((failed + 1))
+    done
+    assert_equals "0" "$failed" || return 1
+    assert_equals "4" "$(grep -c '^enter$' "$log")" || return 1
+    assert_equals "0" "$(grep -c '^overlap$' "$log" || true)" || return 1
 }
 
 test_prune_json() {
@@ -454,7 +498,8 @@ run_test "restore_preview_shows_same_named_dirs_outside_antigravity" test_restor
 run_test "prune_reinit_refuses_when_branch_moved" test_prune_reinit_refuses_when_branch_moved
 run_test "write_commands_refuse_while_locked" test_write_commands_refuse_while_locked
 run_test "writer_waits_for_lock_holder" test_writer_waits_for_lock_holder
-run_test "stale_write_lock_is_taken_over" test_stale_write_lock_is_taken_over
+run_test "lock_dies_with_its_holder" test_lock_dies_with_its_holder
+run_test "simultaneous_writers_never_overlap" test_simultaneous_writers_never_overlap
 run_test "prune_json" test_prune_json
 run_test "prune_unknown_option" test_prune_unknown_option
 
