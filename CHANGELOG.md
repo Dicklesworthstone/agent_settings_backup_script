@@ -16,6 +16,7 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 - **`asb diff` and restore previews match what a restore transfers.** They hid every directory named `conversations` or `brain`; only the excluded ones under `antigravity-cli/` are hidden now.
 - **One writer per backup.** backup, restore, import, tag and prune hold a kernel `flock` on the agent's backup (via `flock(1)` where installed, else perl), which the kernel releases when the holder exits or dies; a second writer waits up to `ASB_LOCK_WAIT` seconds (default 300). `prune --reinit` only replaces the refs it inspected and confirmed, and expires reflogs and garbage-collects only after every ref update succeeds.
 - **`asb verify` with no agent names checks every backup.** With two or more backups it reported "Unknown agent: claude cursor" and verified nothing (the names were sorted as one line).
+- **The test suite no longer touches your crontab.** On a machine without systemd (macOS), every run of `tests/test_schedule.sh` replaced your real `ASB_BACKUP_SCHEDULE` cron entry with one that logs under a deleted temp directory, so the nightly backup failed. If you have run the tests, check `crontab -l`: if the entry's log path is under a temp directory, run `asb schedule --cron` again to restore it, or `asb schedule --remove --cron` to drop it.
 
 ### Added
 
