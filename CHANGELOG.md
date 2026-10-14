@@ -8,6 +8,10 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ## [Unreleased]
 
+### Fixed
+
+- **Gemini CLI chats, Claude Code background jobs and installed agent binaries are no longer backed up.** On real machines these were the largest things left in a backup: single Gemini chat transcripts of 1 GB under `~/.gemini/tmp/<project>/chats/`, release builds under `~/.claude/jobs/<id>/tmp/`, OpenCode's 177 MB `bin/opencode` re-committed on every upgrade, and Codex's macOS app-server bundle under `plugins/.plugin-appserver/`. Now excluded: `tmp/` at the top of any agent's folder, `plugins/.plugin-appserver/`, and per agent `bin/` (OpenCode, Factory) and `jobs/` (Claude Code). Same-named folders deeper down (a skill's `tmp/`) and a `~/.claude/bin` of your own scripts are still backed up, and restore never deletes the excluded live folders. Run `asb prune` to drop copies already in a backup.
+
 ---
 
 ## [v0.3.3] — 2026-10-14

@@ -491,6 +491,109 @@ test_prune_unknown_option() {
     assert_contains "$ASB_LAST_OUTPUT" "Unknown prune option" || return 1
 }
 
+# Top-level scratch and installer output: Gemini CLI's tmp/ (per-project chats),
+# Claude Code's jobs/, OpenCode's bin/. Same-named dirs deeper down, and
+# Claude's own bin/ (user scripts), are settings and stay.
+add_top_level_scratch() {
+    create_mock_agent "gemini"
+    mkdir -p "${HOME}/.gemini/tmp/proj/chats" "${HOME}/.gemini/skills/demo/tmp"
+    printf 'chat\n' > "${HOME}/.gemini/tmp/proj/chats/session-1.jsonl"
+    printf 'keep\n' > "${HOME}/.gemini/skills/demo/tmp/notes.md"
+    create_claude_fixture
+    mkdir -p "${HOME}/.claude/jobs/abc/tmp" "${HOME}/.claude/bin" "${HOME}/.claude/skills/demo/jobs"
+    printf 'state\n' > "${HOME}/.claude/jobs/abc/state.json"
+    printf 'binary\n' > "${HOME}/.claude/jobs/abc/tmp/am"
+    printf '#!/bin/sh\n' > "${HOME}/.claude/bin/statusline.sh"
+    printf 'keep\n' > "${HOME}/.claude/skills/demo/jobs/README.md"
+    create_mock_agent "opencode"
+    mkdir -p "${HOME}/.opencode/bin"
+    printf 'binary\n' > "${HOME}/.opencode/bin/opencode"
+}
+
+assert_top_level_scratch_excluded() {
+    local b="$ASB_BACKUP_ROOT"
+    assert_dir_not_exists "${b}/.gemini/tmp" || return 1
+    assert_file_exists "${b}/.gemini/skills/demo/tmp/notes.md" || return 1
+    assert_file_exists "${b}/.gemini/settings.json" || return 1
+    assert_dir_not_exists "${b}/.claude/jobs" || return 1
+    assert_file_exists "${b}/.claude/bin/statusline.sh" || return 1
+    assert_file_exists "${b}/.claude/skills/demo/jobs/README.md" || return 1
+    assert_dir_not_exists "${b}/.opencode/bin" || return 1
+    assert_file_exists "${b}/.opencode/settings.json" || return 1
+}
+
+test_backup_excludes_top_level_scratch() {
+    add_top_level_scratch
+    run_asb backup gemini claude opencode
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_top_level_scratch_excluded
+}
+
+test_cp_fallback_backup_excludes_top_level_scratch() {
+    add_top_level_scratch
+    use_failing_rsync
+    run_asb backup gemini claude opencode
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_top_level_scratch_excluded
+}
+
+restore_keeps_live_top_level_scratch() {
+    local fallback="$1"
+    add_top_level_scratch
+    run_asb backup gemini opencode
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    # Real settings differences, so the restores actually run.
+    printf '{"changed":true}\n' > "${HOME}/.gemini/settings.json"
+    printf '{"changed":true}\n' > "${HOME}/.opencode/settings.json"
+    [[ "$fallback" == "true" ]] && use_failing_rsync
+
+    run_asb restore gemini --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    run_asb restore opencode --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_not_contains "$(cat "${HOME}/.gemini/settings.json")" "changed" || return 1
+    assert_not_contains "$(cat "${HOME}/.opencode/settings.json")" "changed" || return 1
+    assert_file_exists "${HOME}/.gemini/tmp/proj/chats/session-1.jsonl" || return 1
+    assert_file_exists "${HOME}/.opencode/bin/opencode" || return 1
+}
+
+test_restore_keeps_live_top_level_scratch() {
+    restore_keeps_live_top_level_scratch false
+}
+
+test_cp_fallback_restore_keeps_live_top_level_scratch() {
+    restore_keeps_live_top_level_scratch true
+}
+
+test_diff_ignores_top_level_scratch() {
+    add_top_level_scratch
+    run_asb backup gemini
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    printf 'v2\n' > "${HOME}/.gemini/skills/demo/tmp/notes.md"
+    printf 'live only\n' > "${HOME}/.gemini/tmp/proj/chats/session-2.jsonl"
+    mkdir -p "${HOME}/.gemini/tmp/other"
+
+    run_asb diff gemini
+    assert_contains "$ASB_LAST_OUTPUT" "skills/demo/tmp/notes.md" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "session-2.jsonl" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "other" || return 1
+}
+
+test_prune_removes_legacy_top_level_scratch() {
+    add_top_level_scratch
+    run_asb backup claude opencode
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.opencode" "bin/opencode"
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.claude" "jobs/abc/tmp/am"
+
+    run_asb prune opencode claude --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.opencode" ls-files -- bin)" || return 1
+    assert_equals "" "$(git -C "${ASB_BACKUP_ROOT}/.claude" ls-files -- jobs)" || return 1
+    # Per-agent: Claude's bin/ is not OpenCode's.
+    assert_equals "bin/statusline.sh" "$(git -C "${ASB_BACKUP_ROOT}/.claude" ls-files -- bin)" || return 1
+}
+
 run_test "backup_excludes_codex_session_databases" test_backup_excludes_codex_session_databases
 run_test "backup_excludes_antigravity_transcripts" test_backup_excludes_antigravity_transcripts
 run_test "restore_keeps_live_antigravity_transcripts" test_restore_keeps_live_antigravity_transcripts
@@ -512,6 +615,12 @@ run_test "write_commands_refuse_while_locked" test_write_commands_refuse_while_l
 run_test "writer_waits_for_lock_holder" test_writer_waits_for_lock_holder
 run_test "lock_dies_with_its_holder" test_lock_dies_with_its_holder
 run_test "simultaneous_writers_never_overlap" test_simultaneous_writers_never_overlap
+run_test "backup_excludes_top_level_scratch" test_backup_excludes_top_level_scratch
+run_test "cp_fallback_backup_excludes_top_level_scratch" test_cp_fallback_backup_excludes_top_level_scratch
+run_test "restore_keeps_live_top_level_scratch" test_restore_keeps_live_top_level_scratch
+run_test "cp_fallback_restore_keeps_live_top_level_scratch" test_cp_fallback_restore_keeps_live_top_level_scratch
+run_test "diff_ignores_top_level_scratch" test_diff_ignores_top_level_scratch
+run_test "prune_removes_legacy_top_level_scratch" test_prune_removes_legacy_top_level_scratch
 run_test "prune_json" test_prune_json
 run_test "prune_unknown_option" test_prune_unknown_option
 

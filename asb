@@ -606,10 +606,10 @@ create_backup_commit() {
 # conversations/ and brain/ under ~/.gemini/antigravity-cli. SQLite WAL/SHM
 # sidecars are never a consistent snapshot on their own.
 #
-# These three arrays are the single source of truth. The rsync rules, the
-# diff rules, the cp fallbacks and `asb prune` are all derived from them, and
-# the same rules apply on restore so that `rsync --delete` never removes live
-# data that is (by design) absent from the backup.
+# These arrays are the single source of truth. The rsync rules, the diff
+# rules, the cp fallbacks and `asb prune` are all derived from them, and the
+# same rules apply on restore so that `rsync --delete` never removes live data
+# that is (by design) absent from the backup.
 
 # Directory names excluded at any depth.
 ASB_EXCLUDED_DIRS=(
@@ -629,41 +629,72 @@ ASB_EXCLUDED_FILE_GLOBS=(
     '*.log.[0-9]*' '*.log.gz'
 )
 
-# Directories excluded only at this path relative to the agent's root.
-ASB_EXCLUDED_NESTED=(
+# Directories excluded only at this path relative to the agent's root, for
+# every agent. A one-component entry is a top-level directory: tmp/ holds
+# Gemini CLI's per-project chats and logs (GBs) and Codex's exec wrappers.
+ASB_EXCLUDED_NESTED_ALL=(
     antigravity-cli/conversations
     antigravity-cli/brain
     packages/app-server-daemon
+    plugins/.plugin-appserver
+    tmp
 )
 
-ASB_RSYNC_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
+# Root-relative exclusions for one agent only (space-separated). bin/ is
+# installer output in OpenCode (its 185 MB CLI) and Factory (a bundled rg);
+# a rule for every agent would also drop scripts users keep in ~/.claude/bin.
+# Claude Code's jobs/ holds background-job state and scratch builds.
+declare -A ASB_AGENT_EXCLUDED_NESTED=(
+    [opencode]="bin"
+    [factory]="bin"
+    [claude]="jobs"
+)
+
+ASB_RSYNC_EXCLUDES_BASE=(--exclude='.git' --exclude='.gitignore')
 # `diff -rq` matches base names only (no trailing slashes).
 ASB_DIFF_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
 for _asb_x in "${ASB_EXCLUDED_DIRS[@]}"; do
-    ASB_RSYNC_EXCLUDES+=("--exclude=${_asb_x}/")
+    ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${_asb_x}/")
     ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
 done
 for _asb_x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
-    ASB_RSYNC_EXCLUDES+=("--exclude=${_asb_x}")
+    ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${_asb_x}")
     ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
 done
-for _asb_x in "${ASB_EXCLUDED_NESTED[@]}"; do
-    # The leading slash anchors the rule at the agent's root. diff cannot
-    # anchor an exclude, so asb_filter_nested_diff drops these from its output.
-    ASB_RSYNC_EXCLUDES+=("--exclude=/${_asb_x}/")
-done
 unset _asb_x
+
+# Select the policy for one agent: ASB_EXCLUDED_NESTED (the root-relative
+# exclusions in force) and ASB_RSYNC_EXCLUDES. Every per-agent operation
+# calls this first; with no agent only the shared rules apply.
+asb_use_policy() {
+    local agent="${1:-}" x
+    local -a extra=()
+    ASB_EXCLUDED_NESTED=("${ASB_EXCLUDED_NESTED_ALL[@]}")
+    if [[ -n "$agent" && -n "${ASB_AGENT_EXCLUDED_NESTED[$agent]:-}" ]]; then
+        read -r -a extra <<< "${ASB_AGENT_EXCLUDED_NESTED[$agent]}"
+        ASB_EXCLUDED_NESTED+=("${extra[@]}")
+    fi
+    ASB_RSYNC_EXCLUDES=("${ASB_RSYNC_EXCLUDES_BASE[@]}")
+    for x in "${ASB_EXCLUDED_NESTED[@]}"; do
+        # The leading slash anchors the rule at the agent's root. diff cannot
+        # anchor an exclude, so asb_filter_nested_diff drops these from its output.
+        ASB_RSYNC_EXCLUDES+=("--exclude=/${x}/")
+    done
+}
+asb_use_policy
 
 # Filter `diff -rq ROOT_A ROOT_B` output (stdin) down to what rsync would
 # transfer: drop lines inside an ASB_EXCLUDED_NESTED path of either root, and
 # keep same-named directories anywhere else.
 asb_filter_nested_diff() {
-    local root_a="$1" root_b="$2" line x r keep
+    local root_a="$1" root_b="$2" line x r parent keep
     while IFS= read -r line; do
         keep=true
         for x in "${ASB_EXCLUDED_NESTED[@]}"; do
             for r in "$root_a" "$root_b"; do
-                if [[ "$line" == "Only in ${r}/${x%/*}: ${x##*/}" \
+                parent="$r"
+                [[ "$x" == */* ]] && parent="${r}/${x%/*}"
+                if [[ "$line" == "Only in ${parent}: ${x##*/}" \
                     || "$line" == *"${r}/${x}/"* \
                     || "$line" == *"${r}/${x}:"* \
                     || "$line" == *"${r}/${x} "* ]]; then
@@ -687,6 +718,9 @@ asb_is_excluded_name() {
         # shellcheck disable=SC2053 # the right-hand side is a glob on purpose
         [[ "$name" == $candidate ]] && return 0
     done
+    for candidate in "${ASB_EXCLUDED_NESTED[@]}"; do
+        [[ "$candidate" != */* && "$name" == "$candidate" ]] && return 0
+    done
     return 1
 }
 
@@ -696,7 +730,7 @@ asb_is_excluded_name() {
 asb_holds_nested_exclusion() {
     local name="$1" nested
     for nested in "${ASB_EXCLUDED_NESTED[@]}"; do
-        [[ "${nested%%/*}" == "$name" ]] && return 0
+        [[ "$nested" == */* && "${nested%%/*}" == "$name" ]] && return 0
     done
     return 1
 }
@@ -735,9 +769,9 @@ asb_strip_excluded() {
     for x in "${ASB_EXCLUDED_NESTED[@]}"; do
         # A copied symlink (antigravity-cli -> elsewhere) would lead rm into
         # live data outside $dir; nothing behind a link is ours to remove.
-        linked=false rel=""
-        IFS=/ read -r -a comps <<< "${x%/*}"
-        for comp in "${comps[@]}"; do
+        linked=false rel="" comps=()
+        [[ "$x" == */* ]] && IFS=/ read -r -a comps <<< "${x%/*}"
+        for comp in ${comps[@]+"${comps[@]}"}; do
             rel+="/${comp}"
             [[ -L "${dir}${rel}" ]] && linked=true
         done
@@ -748,6 +782,7 @@ asb_strip_excluded() {
 
 backup_agent() {
     local agent="$1"
+    asb_use_policy "$agent"
     local source
     local dest
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
@@ -1159,6 +1194,7 @@ confirm_restore() {
 
 restore_agent() {
     local agent="$1"
+    asb_use_policy "$agent"
     local commit_ref="${2:-HEAD}"
     local source
     local dest
@@ -2282,6 +2318,7 @@ show_history() {
 
 show_diff() {
     local agent="$1"
+    asb_use_policy "$agent"
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
     local source
     local dest
@@ -4210,6 +4247,7 @@ asb_kib_human() {
 # Sets PRUNE_AGENT_RESULT (JSON object).
 prune_agent() {
     local agent="$1" reinit="$2"
+    asb_use_policy "$agent"
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
     local jname dest
     jname=$(json_escape_string "$agent_name")
