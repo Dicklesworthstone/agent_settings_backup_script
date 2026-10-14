@@ -224,4 +224,4 @@ run_test "schedule_status_no_schedule" test_schedule_status_no_schedule || true
 run_test "schedule_both_modes" test_schedule_both_modes || true
 run_test "schedule_status_both_modes" test_schedule_status_both_modes || true
 
-exit 0
+finish_suite

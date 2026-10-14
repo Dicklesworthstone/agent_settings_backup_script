@@ -220,4 +220,4 @@ run_test "verify_json_all" test_verify_json_all || true
 run_test "verify_json_error" test_verify_json_error || true
 run_test "verify_shows_summary" test_verify_shows_summary || true
 
-exit 0
+finish_suite

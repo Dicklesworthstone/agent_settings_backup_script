@@ -361,4 +361,4 @@ run_test "restore_preserves_unicode_content" test_restore_preserves_unicode_cont
 run_test "json_output_unicode_agent" test_json_output_unicode_agent || true
 run_test "json_output_unicode_diff" test_json_output_unicode_diff || true
 
-exit 0
+finish_suite

@@ -358,4 +358,4 @@ run_test "diff_large_files" test_diff_large_files || true
 run_test "empty_files" test_empty_files || true
 run_test "sparse_file" test_sparse_file || true
 
-exit 0
+finish_suite

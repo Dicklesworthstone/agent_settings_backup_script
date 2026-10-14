@@ -309,4 +309,4 @@ run_test "symlink_self_reference" test_symlink_self_reference || true
 run_test "symlink_deep_nesting" test_symlink_deep_nesting || true
 run_test "symlink_absolute_path" test_symlink_absolute_path || true
 
-exit 0
+finish_suite

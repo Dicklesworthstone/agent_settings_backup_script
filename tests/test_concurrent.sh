@@ -302,4 +302,4 @@ run_test "rapid_sequential_backups" test_rapid_sequential_backups || true
 run_test "concurrent_multiple_agents_stress" test_concurrent_multiple_agents_stress || true
 run_test "backup_during_modification" test_backup_during_modification || true
 
-exit 0
+finish_suite

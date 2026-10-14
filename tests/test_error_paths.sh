@@ -324,4 +324,4 @@ run_test "json_error_format" test_json_error_format || true
 run_test "unknown_command" test_unknown_command || true
 run_test "missing_required_args" test_missing_required_args || true
 
-exit 0
+finish_suite
