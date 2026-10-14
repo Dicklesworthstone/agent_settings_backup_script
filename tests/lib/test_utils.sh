@@ -154,7 +154,7 @@ run_test() {
     setup_test_env
     # Run inside the test's scratch dir so default-named output (e.g. export's
     # claude-backup-DATE.tar.gz) never lands in the caller's directory.
-    if ( set -euo pipefail; cd "$TEST_ENV_ROOT"; "$func" ); then
+    if ( set -euo pipefail; cd "$TEST_ENV_ROOT" || exit 1; "$func" ); then
         log_pass "$test_name"
         teardown_test_env
         clear_current_test
