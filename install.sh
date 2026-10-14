@@ -27,7 +27,7 @@ REPO_OWNER="Dicklesworthstone"
 REPO_NAME="agent_settings_backup_script"
 SCRIPT_NAME="asb"
 GITHUB_RAW="https://raw.githubusercontent.com"
-HTTP_USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+HTTP_USER_AGENT="asb-installer (+https://github.com/Dicklesworthstone/agent_settings_backup_script)"
 
 #==============================================================================
 # COLORS

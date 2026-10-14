@@ -734,7 +734,7 @@ test_public_installer_workflow() {
     assert_contains "$output" "Failed to download release" || return 1
     assert_dir_not_exists "$missing_dir" || return 1
 
-    curl -fsSL -A 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+    curl -fsSL -A 'asb-installer-e2e (+https://github.com/Dicklesworthstone/agent_settings_backup_script)' \
         "https://github.com/Dicklesworthstone/agent_settings_backup_script/releases/download/$tag/asb-checksums.txt" \
         -o "$manifest" || return 1
     ( source "$installer"; verify_release_checksum "$pinned_dir/asb" "$manifest" ) || return 1
