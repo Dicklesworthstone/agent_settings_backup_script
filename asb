@@ -1270,6 +1270,38 @@ asb_list_tracked_credentials() {
     git -C "$dest" ls-files -- "${specs[@]}" 2>/dev/null
 }
 
+# Print the credential files that a backup commit holds (copied by an earlier
+# asb) and that a restore therefore leaves out. Names only; nothing is read.
+asb_list_commit_credentials() {
+    local repo="$1" commit="$2" path name glob
+    asb_includes_credentials && return 0
+    while IFS= read -r -d '' path; do
+        name="${path##*/}"
+        for glob in "${ASB_CREDENTIAL_FILE_GLOBS[@]}"; do
+            # shellcheck disable=SC2053 # Policy basename globs are intentional.
+            if [[ "$name" == $glob ]]; then
+                printf '%s\n' "$path"
+                break
+            fi
+        done
+    done < <(git -C "$repo" ls-tree -r --name-only -z "$commit" 2>/dev/null)
+}
+
+# A restore that silently skipped them would look like it brought the login
+# back. Say which credential files in the chosen backup stay out, and how to
+# restore them anyway.
+asb_report_restore_credentials() {
+    local repo="$1" commit="$2" line
+    local -a not_restored=()
+    is_json_output && return 0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && not_restored+=("$line")
+    done < <(asb_list_commit_credentials "$repo" "$commit")
+    (( ${#not_restored[@]} > 0 )) || return 0
+    log_warn "Not restored: ${#not_restored[@]} credential file(s) in this backup: ${not_restored[*]:0:5}"
+    log_info "  Credential files are left out by default; ASB_INCLUDE_CREDENTIALS=true restores them, replacing live copies"
+}
+
 # Tell the user which credential files a backup leaves out (dry run only)
 # and which ones the backup still tracks from an earlier asb. Paths only.
 asb_report_credentials() {
@@ -1921,6 +1953,7 @@ restore_agent() (
             log_error "Could not generate restore preview"
             return 1
         fi
+        asb_report_restore_credentials "$source" "$commit"
     else
         # JSON previews use the same snapshot and the same read policy.
         RESTORE_HAS_CHANGES=false

@@ -170,6 +170,36 @@ test_restore_ignores_credentials_an_earlier_backup_holds() {
     assert_equals "rotated" "$(cat "${HOME}/.claude/.credentials.json")" || return 1
 }
 
+# Restoring an older backup onto a fresh machine brings back the settings but
+# not the login it holds; the restore must say so instead of looking complete.
+test_restore_names_credentials_it_leaves_out() {
+    setup_agents_with_credentials
+    run_asb backup claude
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    commit_legacy_file "${ASB_BACKUP_ROOT}/.claude" ".credentials.json"
+    mv "${HOME}/.claude" "${TEST_ENV_ROOT}/old-claude"
+
+    run_asb --dry-run restore claude
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Not restored: 1 credential file(s) in this backup: .credentials.json" || return 1
+
+    run_asb restore claude --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_file_exists "${HOME}/.claude/settings.json" || return 1
+    assert_file_not_exists "${HOME}/.claude/.credentials.json" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "Not restored: 1 credential file(s) in this backup: .credentials.json" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "ASB_INCLUDE_CREDENTIALS=true restores them" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "legacy .credentials.json" || return 1
+
+    # With the opt-in the file comes back and there is nothing to report.
+    rm -rf "${HOME}/.claude"
+    export ASB_INCLUDE_CREDENTIALS=true
+    run_asb restore claude --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_equals "legacy .credentials.json" "$(cat "${HOME}/.claude/.credentials.json")" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "Not restored" || return 1
+}
+
 test_cp_fallback_restore_keeps_live_credentials() {
     setup_agents_with_credentials
     run_asb backup claude
@@ -735,6 +765,7 @@ run_test "include_credentials_env_opt_in" test_include_credentials_env_opt_in
 run_test "include_credentials_config_opt_in" test_include_credentials_config_opt_in
 run_test "restore_keeps_live_credentials" test_restore_keeps_live_credentials
 run_test "restore_ignores_credentials_an_earlier_backup_holds" test_restore_ignores_credentials_an_earlier_backup_holds
+run_test "restore_names_credentials_it_leaves_out" test_restore_names_credentials_it_leaves_out
 run_test "cp_fallback_restore_keeps_live_credentials" test_cp_fallback_restore_keeps_live_credentials
 run_test "cp_fallback_keeps_legacy_excluded_backup_files" test_cp_fallback_keeps_legacy_excluded_backup_files
 run_test "git_staging_ignores_new_excluded_files" test_git_staging_ignores_new_excluded_files

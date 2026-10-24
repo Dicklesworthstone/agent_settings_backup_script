@@ -664,7 +664,8 @@ CLI, Qwen Code), `mcp-oauth-tokens.json` (Gemini CLI's MCP logins),
 `*.keychain-db`. The rule covers rsync and the `cp` fallback, and
 `asb backup --dry-run` lists skipped credential paths without displaying their
 contents. Restore preserves live credential files and does not restore their
-older versions. API keys embedded in an allowed settings file, such as an MCP
+older versions; when the chosen backup holds one, restore names it as not
+restored. API keys embedded in an allowed settings file, such as an MCP
 server's `env` block in `settings.json`, remain part of that file and are backed
 up. Use [Path Exclusions](#path-exclusions) to exclude additional files or
 directories. To deliberately include the default credential filenames, set
