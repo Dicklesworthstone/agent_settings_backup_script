@@ -84,11 +84,13 @@ jobs:
           - test_completion.sh
           - test_config.sh
           - test_conflict.sh
+          - test_credentials.sh
           - test_discover.sh
           - test_dryrun.sh
           - test_export.sh
           - test_hooks.sh
           - test_json.sh
+          - test_prune.sh
           - test_stats.sh
           - test_tags.sh
     steps:

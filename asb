@@ -33,6 +33,7 @@
 #   ASB_VERBOSE             Verbose output (default: false)
 #   ASB_LOCK_WAIT           Seconds to wait for another asb writing the same backup (default: 300)
 #   ASB_INCLUDE_CREDENTIALS Back up login tokens and API key files too (default: false)
+#   ASB_EXCLUDE_PATHS       Additional literal agent-relative paths, one per line
 #
 # Repository: https://github.com/Dicklesworthstone/agent_settings_backup_script
 # License: MIT
@@ -45,7 +46,10 @@
 # block Bash 3.2-compatible.
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     for asb_bash in /opt/homebrew/bin/bash /usr/local/bin/bash /home/linuxbrew/.linuxbrew/bin/bash $(type -ap bash 2>/dev/null); do
-        [ -x "$asb_bash" ] && [ "$asb_bash" != "${BASH:-}" ] || continue
+        if [ ! -x "$asb_bash" ] || [ "$asb_bash" = "${BASH:-}" ]; then
+            continue
+        fi
+        # shellcheck disable=SC2016 # Expand BASH_VERSINFO in the candidate shell.
         if [ "$("$asb_bash" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
             exec "$asb_bash" "$0" "$@"
         fi
@@ -516,6 +520,126 @@ load_config() {
 # GIT OPERATIONS
 #==============================================================================
 
+# Stage only paths allowed by the active backup policy. Ignore files alone are
+# not sufficient: older backups may already track an excluded path, and a hook
+# or manual git add may have staged a new copy. Restore ONLY those index entries
+# to their existing HEAD versions (or remove them from an unborn index), without
+# reading or changing their working-tree contents or rewriting any history.
+asb_stage_allowed_changes() (
+    local dir="$1" agent="$2" work path listing parent rest component record has_head=false
+    local blocked_parent
+    local -A excluded=() protected_parents=() seen=()
+    asb_use_policy "$agent" || return 1
+    work=$(mktemp -d 2>/dev/null || mktemp -d -t asb-index.XXXXXXXX) || return 1
+    trap 'rm -rf -- "$work"' EXIT
+
+    # Enumerate names, never file contents. Passing unmatched nested exclusion
+    # patterns to git add can fail when their parent is a symlink. Exact names
+    # also let us avoid staging a directory recursively when it contains secrets.
+    if ! git -C "$dir" ls-files --cached --others --exclude-standard -z > "$work/candidates" 2>/dev/null; then
+        log_error "Could not inspect backup paths for staging"
+        return 1
+    fi
+    if ! git -C "$dir" ls-files --stage -z > "$work/index" 2>/dev/null; then
+        log_error "Could not inspect the backup index"
+        return 1
+    fi
+    while IFS= read -r -d '' record; do
+        if [[ "$record" == '160000 '* ]]; then
+            log_error "The backup index contains a nested Git repository; inspect it before backing up again (no index changes made)"
+            return 1
+        fi
+    done < "$work/index"
+    : > "$work/head" || return 1
+    if git -C "$dir" rev-parse --verify HEAD >/dev/null 2>&1; then
+        has_head=true
+        if ! git -C "$dir" ls-tree -r --name-only -z HEAD > "$work/head" 2>/dev/null; then
+            log_error "Could not inspect the existing backup snapshot"
+            return 1
+        fi
+    fi
+    : > "$work/excluded" || return 1
+    : > "$work/add" || return 1
+    : > "$work/remove" || return 1
+
+    # Include HEAD as well as the index: an excluded file whose deletion was
+    # pre-staged must also keep its prior version until an explicit prune.
+    for listing in "$work/candidates" "$work/head"; do
+        while IFS= read -r -d '' path; do
+            [[ "$path" == .gitignore ]] && continue
+            asb_is_excluded_path "$path" f || continue
+            [[ -n "${excluded[$path]:-}" ]] && continue
+            excluded["$path"]=1
+            printf '%s\0' "$path" >> "$work/excluded" || return 1
+            parent="$path"
+            while [[ "$parent" == */* ]]; do
+                parent="${parent%/*}"
+                protected_parents["$parent"]=1
+            done
+        done < "$listing"
+    done
+
+    while IFS= read -r -d '' path; do
+        [[ -n "${seen[$path]:-}" ]] && continue
+        seen["$path"]=1
+        [[ -n "${excluded[$path]:-}" ]] && continue
+        if [[ "$path" == */ ]]; then
+            # ls-files reports an untracked embedded repository as a directory,
+            # not as its individual files. Do not silently omit its settings or
+            # add a gitlink whose objects are absent from this backup.
+            log_error "The backup contains an untracked nested Git repository; inspect it before backing up again (no index changes made)"
+            return 1
+        fi
+        # A tracked directory may have been replaced by a file or symlink.
+        # Drop stale allowed descendants from the index without following that
+        # parent into any external files. Its new leaf is enumerated separately.
+        blocked_parent=false parent="" rest="$path"
+        while [[ "$rest" == */* ]]; do
+            component="${rest%%/*}"
+            rest="${rest#*/}"
+            parent="${parent:+$parent/}${component}"
+            if [[ -L "$dir/$parent" || ! -d "$dir/$parent" ]]; then
+                blocked_parent=true
+                break
+            fi
+        done
+        if [[ "$blocked_parent" == true || ( -d "$dir/$path" && ! -L "$dir/$path" ) \
+            || ( ! -e "$dir/$path" && ! -L "$dir/$path" ) ]]; then
+            printf '%s\0' "$path" >> "$work/remove" || return 1
+        else
+            if [[ -n "${protected_parents[$path]:-}" ]]; then
+                log_error "Cannot stage a file or link over previously tracked excluded data; prune that data explicitly first"
+                return 1
+            fi
+            printf '%s\0' "$path" >> "$work/add" || return 1
+        fi
+    done < "$work/candidates"
+
+    if [[ -s "$work/excluded" ]]; then
+        if [[ "$has_head" == true ]]; then
+            if ! git -C "$dir" --literal-pathspecs reset -q --no-refresh HEAD \
+                --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>&1; then
+                log_error "Could not protect excluded paths in the backup index"
+                return 1
+            fi
+        elif ! git -C "$dir" --literal-pathspecs rm -q -r -f --cached --ignore-unmatch \
+            --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>&1; then
+            log_error "Could not remove excluded paths from the initial backup index"
+            return 1
+        fi
+    fi
+    if [[ -s "$work/remove" ]] && ! git -C "$dir" update-index --force-remove -z --stdin < "$work/remove" >/dev/null 2>&1; then
+        log_error "Could not stage removed backup settings"
+        return 1
+    fi
+    if [[ -s "$work/add" ]] && ! git -C "$dir" --literal-pathspecs add -A \
+        --pathspec-from-file="$work/add" --pathspec-file-nul >/dev/null 2>&1; then
+        log_error "Could not stage allowed backup files"
+        return 1
+    fi
+    return 0
+)
+
 init_git_repo() {
     local dir="$1"
     local agent="$2"
@@ -527,10 +651,14 @@ init_git_repo() {
             return 0
         fi
         log_step "Initializing git repository for ${agent_name}..."
-        git -C "$dir" init --initial-branch=main >/dev/null 2>&1 || git -C "$dir" init >/dev/null 2>&1
+        if ! git -C "$dir" init --initial-branch=main >/dev/null 2>&1 \
+            && ! git -C "$dir" init >/dev/null 2>&1; then
+            log_error "Could not initialize git repository for ${agent_name}"
+            return 1
+        fi
 
         # Create .gitignore for common exclusions
-        cat > "$dir/.gitignore" << 'EOF'
+        if ! cat > "$dir/.gitignore" << 'EOF'
 # Logs and temporary files
 *.log
 *.tmp
@@ -555,10 +683,17 @@ Thumbs.db
 *.db-wal
 *.db-shm
 EOF
+        then
+            log_error "Could not write backup .gitignore for ${agent_name}"
+            return 1
+        fi
 
         # Initial commit
-        git -C "$dir" add -A >/dev/null 2>&1
-        git -C "$dir" commit -m "Initial backup of ${agent_name} settings" --allow-empty >/dev/null 2>&1
+        asb_stage_allowed_changes "$dir" "$agent" || return 1
+        if ! git -C "$dir" commit -m "Initial backup of ${agent_name} settings" --allow-empty >/dev/null 2>&1; then
+            log_error "Could not create initial backup commit for ${agent_name}"
+            return 1
+        fi
         log_success "Git repository initialized"
     fi
 }
@@ -568,24 +703,26 @@ create_backup_commit() {
     local agent="$2"
     local message="${3:-}"
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    LAST_BACKUP_COMMIT=""
 
     if is_dry_run; then
         log_dry "Would create backup commit for ${agent_name}"
         return 0
     fi
 
-    # Check for changes
-    if git -C "$dir" diff --quiet HEAD 2>/dev/null && git -C "$dir" diff --staged --quiet 2>/dev/null; then
-        # Check for untracked files
-        if [[ -z "$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-            log_info "No changes detected for ${agent_name}"
-            LAST_BACKUP_COMMIT=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "")
-            return 0
-        fi
+    # Sanitize pre-staged exclusions before checking for changes. Excluded-only
+    # edits must not create a commit or cause their contents to enter Git.
+    asb_stage_allowed_changes "$dir" "$agent" || return 1
+    local diff_status=0
+    git -C "$dir" diff --cached --quiet >/dev/null 2>&1 || diff_status=$?
+    if (( diff_status == 0 )); then
+        log_info "No changes detected for ${agent_name}"
+        LAST_BACKUP_COMMIT=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo "")
+        return 0
+    elif (( diff_status != 1 )); then
+        log_error "Could not inspect staged backup files for ${agent_name}"
+        return 1
     fi
-
-    # Stage all changes
-    git -C "$dir" add -A >/dev/null 2>&1
 
     # Generate commit message if not provided
     if [[ -z "$message" ]]; then
@@ -597,7 +734,10 @@ create_backup_commit() {
     fi
 
     # Commit
-    git -C "$dir" commit -m "$message" >/dev/null 2>&1
+    if ! git -C "$dir" commit -m "$message" >/dev/null 2>&1; then
+        log_error "Could not create backup commit for ${agent_name}"
+        return 1
+    fi
     log_success "Created backup commit for ${agent_name}"
 
     # Show brief summary
@@ -696,6 +836,54 @@ declare -A ASB_AGENT_EXCLUDED_NESTED=(
     [codex]="computer-use"
 )
 
+# User exclusions extend the policy, including when credential inclusion is
+# explicitly enabled. Newlines separate literal paths so spaces, colons and
+# glob characters in a filename keep their meaning. Per-agent entries use the
+# same identifiers as built-in/custom agent mappings and are set in config.
+ASB_EXCLUDE_PATHS="${ASB_EXCLUDE_PATHS:-}"
+declare -A ASB_AGENT_EXCLUDE_PATHS=()
+ASB_CONFIG_EXCLUDED_PATHS=()
+
+# Parse and validate before any backup, restore or prune can mutate files.
+# The result is a literal path list, never shell code or rsync filter syntax.
+asb_parse_exclusion_paths() {
+    local value="$1" path
+    ASB_PARSED_EXCLUDE_PATHS=()
+    while IFS= read -r path || [[ -n "$path" ]]; do
+        [[ -n "$path" ]] || continue
+        path="${path%/}"
+        case "/${path}/" in
+            *'/../'*|*'/./'*|*'//'*|*'/.git/'*|*'/.gitignore/'*|*$'\r'*|*$'\t'*)
+                log_error "Invalid exclusion path: use a relative file/directory path without '.', '..', empty components or Git metadata"
+                return 1
+                ;;
+        esac
+        ASB_PARSED_EXCLUDE_PATHS+=("$path")
+    done <<< "$value"
+}
+
+asb_validate_exclusion_config() {
+    local agent
+    asb_parse_exclusion_paths "${ASB_EXCLUDE_PATHS:-}" || return 1
+    for agent in "${!ASB_AGENT_EXCLUDE_PATHS[@]}"; do
+        asb_parse_exclusion_paths "${ASB_AGENT_EXCLUDE_PATHS[$agent]}" || return 1
+    done
+}
+
+# rsync accepts wildcard rules; escape our literal paths before passing them.
+asb_rsync_literal_path() {
+    local path="$1"
+    # rsync only interprets backslash escapes when it detects wildcard syntax.
+    # Without *, ? or [, a backslash (and a lone ]) must be passed literally.
+    if [[ "$path" == *'*'* || "$path" == *'?'* || "$path" == *'['* ]]; then
+        path="${path//\\/\\\\}"
+    fi
+    path="${path//\*/\\*}"
+    path="${path//\?/\\?}"
+    path="${path//\[/\\[}"
+    printf '%s' "$path"
+}
+
 asb_includes_credentials() {
     is_truthy "${ASB_INCLUDE_CREDENTIALS:-false}"
 }
@@ -735,14 +923,258 @@ asb_use_policy() {
         read -r -a extra <<< "${ASB_AGENT_EXCLUDED_NESTED[$agent]}"
         ASB_EXCLUDED_NESTED+=("${extra[@]}")
     fi
+    asb_parse_exclusion_paths "${ASB_EXCLUDE_PATHS:-}" || return 1
+    ASB_CONFIG_EXCLUDED_PATHS=("${ASB_PARSED_EXCLUDE_PATHS[@]}")
+    if [[ -n "$agent" ]]; then
+        asb_parse_exclusion_paths "${ASB_AGENT_EXCLUDE_PATHS[$agent]:-}" || return 1
+        ASB_CONFIG_EXCLUDED_PATHS+=("${ASB_PARSED_EXCLUDE_PATHS[@]}")
+    fi
     ASB_RSYNC_EXCLUDES=("${ASB_RSYNC_EXCLUDES_BASE[@]}")
     for x in "${ASB_EXCLUDED_NESTED[@]}"; do
         # The leading slash anchors the rule at the agent's root. diff cannot
         # anchor an exclude, so asb_filter_nested_diff drops these from its output.
         ASB_RSYNC_EXCLUDES+=("--exclude=/${x}/")
     done
+    for x in "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
+        ASB_RSYNC_EXCLUDES+=("--exclude=/$(asb_rsync_literal_path "$x")")
+    done
 }
 asb_use_policy
+
+# The shared pathname matcher. No file contents are inspected. An ancestor
+# match excludes the entire subtree; the last component's kind distinguishes
+# directories from regular files/symlinks for the built-in directory rules.
+asb_is_excluded_path() {
+    local rel="$1" kind="${2:-f}" path name rest="$1" component_kind candidate
+    for path in "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
+        [[ "$rel" == "$path" || "$rel" == "$path/"* ]] && return 0
+    done
+    for path in "${ASB_EXCLUDED_NESTED[@]}"; do
+        [[ "$rel" == "$path/"* ]] && return 0
+        [[ "$rel" == "$path" && "$kind" == d ]] && return 0
+    done
+    while [[ -n "$rest" ]]; do
+        name="${rest%%/*}"
+        component_kind="$kind"
+        if [[ "$rest" == */* ]]; then
+            component_kind=d
+            rest="${rest#*/}"
+        else
+            rest=""
+        fi
+        [[ "$name" == .git || "$name" == .gitignore ]] && return 0
+        if [[ "$component_kind" == d ]]; then
+            for candidate in "${ASB_EXCLUDED_DIRS[@]}"; do
+                [[ "$name" == "$candidate" ]] && return 0
+            done
+        fi
+        for candidate in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+            # shellcheck disable=SC2053 # Policy basename globs are intentional.
+            [[ "$name" == $candidate ]] && return 0
+        done
+    done
+    return 1
+}
+
+# Copy only permitted entries into a private staging directory. Unlike a
+# recursive cp followed by deletion, this never opens an excluded credential,
+# even transiently. Symlinks are copied as links and never traversed.
+asb_copy_filtered() {
+    local source="$1" dest="$2" prefix="${3:-}" entry name rel kind
+    [[ -d "$source" && -r "$source" && -x "$source" && ! -L "$dest" ]] || return 1
+    mkdir -p -- "$dest" || return 1
+    for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        rel="${prefix:+$prefix/}${name}"
+        kind=f
+        [[ -d "$entry" && ! -L "$entry" ]] && kind=d
+        asb_is_excluded_path "$rel" "$kind" && continue
+        if [[ "$kind" == d ]]; then
+            asb_copy_filtered "$entry" "$dest/$name" "$rel" || return 1
+        elif [[ -f "$entry" || -L "$entry" ]]; then
+            [[ ! -L "$dest/$name" && ! -d "$dest/$name" ]] || return 1
+            cp -pP -- "$entry" "$dest/$name" || return 1
+        else
+            # Pipes, devices and sockets cannot be a consistent settings
+            # snapshot. Refuse instead of hanging or reporting partial success.
+            log_error "Cannot copy a special file in the settings snapshot"
+            return 1
+        fi
+    done
+}
+
+# True if deleting/replacing this directory would remove protected data.
+# Also protect an unreadable subtree: absence of evidence is not permission
+# to remove credentials that may be inside it.
+asb_has_excluded_descendants() {
+    local dir="$1" prefix="$2" entry name rel kind
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -r "$dir" && -x "$dir" ]] || return 0
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        rel="${prefix:+$prefix/}${name}"
+        kind=f
+        [[ -d "$entry" && ! -L "$entry" ]] && kind=d
+        asb_is_excluded_path "$rel" "$kind" && return 0
+        if [[ "$kind" == d ]] && asb_has_excluded_descendants "$entry" "$rel"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Remove stale allowed entries recursively, leaving excluded descendants and
+# their parents intact. Never descend through a destination symlink.
+asb_remove_allowed() {
+    local entry="$1" rel="$2" child name kind=f
+    [[ -d "$entry" && ! -L "$entry" ]] && kind=d
+    asb_is_excluded_path "$rel" "$kind" && return 0
+    if [[ "$kind" == d ]]; then
+        [[ -r "$entry" && -x "$entry" ]] || return 1
+        for child in "$entry"/* "$entry"/.[!.]* "$entry"/..?*; do
+            [[ -e "$child" || -L "$child" ]] || continue
+            name="${child##*/}"
+            asb_remove_allowed "$child" "$rel/$name" || return 1
+        done
+        # A directory holding excluded data is deliberately left in place.
+        if ! asb_has_excluded_descendants "$entry" "$rel"; then
+            rmdir -- "$entry" || return 1
+        fi
+    else
+        rm -f -- "$entry" || return 1
+    fi
+}
+
+# Check type conflicts before the fallback writes anything to a destination.
+# In particular, a backed-up file/link may not replace a live directory that
+# now holds an excluded credential, cache, or user-configured private path.
+asb_sync_preflight() {
+    local source="$1" dest="$2" prefix="${3:-}" entry name rel kind target
+    [[ ! -L "$dest" ]] || return 1
+    for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        rel="${prefix:+$prefix/}${name}"
+        target="$dest/$name"
+        kind=f
+        [[ -d "$entry" && ! -L "$entry" ]] && kind=d
+        asb_is_excluded_path "$rel" "$kind" && continue
+        if [[ "$kind" == d ]]; then
+            if [[ -d "$target" && ! -L "$target" ]]; then
+                asb_sync_preflight "$entry" "$target" "$rel" || return 1
+            fi
+        elif [[ -d "$target" && ! -L "$target" ]] && asb_has_excluded_descendants "$target" "$rel"; then
+            log_error "Cannot replace a directory containing excluded data"
+            return 1
+        fi
+    done
+}
+
+# Synchronize an already-filtered snapshot with the same deletion protection
+# as rsync. This never follows destination symlinks or merges with cp -r.
+asb_install_entry() (
+    local source="$1" target="$2" rel="$3" staged
+    staged=$(mktemp -d "${target%/*}/.asb-copy.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$staged"' EXIT
+    # Complete the copy before replacing the old entry. A failed cp must not
+    # destroy a previously good setting. Rename also breaks hard links safely.
+    cp -pP -- "$source" "$staged/entry" || return 1
+    if [[ -d "$target" && ! -L "$target" ]]; then
+        asb_remove_allowed "$target" "$rel" || return 1
+        [[ ! -d "$target" ]] || return 1
+    elif [[ -L "$target" ]]; then
+        # Portable mv may treat a symlink to a directory as its destination.
+        rm -f -- "$target" || return 1
+    fi
+    mv -f -- "$staged/entry" "$target"
+)
+
+asb_sync_filtered() {
+    local source="$1" dest="$2" prefix="${3:-}" entry name rel kind target
+    [[ -d "$source" && ! -L "$source" && ! -L "$dest" ]] || return 1
+    if [[ -z "$prefix" ]]; then
+        asb_sync_preflight "$source" "$dest" || return 1
+    fi
+    mkdir -p -- "$dest" || return 1
+    for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        rel="${prefix:+$prefix/}${name}"
+        target="$dest/$name"
+        kind=f
+        [[ -d "$entry" && ! -L "$entry" ]] && kind=d
+        asb_is_excluded_path "$rel" "$kind" && continue
+        if [[ "$kind" == d ]]; then
+            if [[ -L "$target" || ( -e "$target" && ! -d "$target" ) ]]; then
+                rm -f -- "$target" || return 1
+            fi
+            asb_sync_filtered "$entry" "$target" "$rel" || return 1
+        else
+            asb_install_entry "$entry" "$target" "$rel" || return 1
+        fi
+    done
+    # Delay removal of stale settings until all copies at this level succeed.
+    for entry in "$dest"/* "$dest"/.[!.]* "$dest"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        name="${entry##*/}"
+        rel="${prefix:+$prefix/}${name}"
+        if [[ ! -e "$source/$name" && ! -L "$source/$name" ]]; then
+            asb_remove_allowed "$entry" "$rel" || return 1
+        fi
+    done
+}
+
+# Produce diff -rq-style records by visiting only allowed files. Filtering
+# diff's output is too late: diff would already have read private paths and
+# followed symlinks. Empty directories have no Git representation.
+asb_policy_diff() {
+    local root_a="$1" root_b="$2" prefix="${3:-}" dir entry name rel a b kind_a kind_b status
+    local -A seen=()
+    for dir in "$root_a${prefix:+/$prefix}" "$root_b${prefix:+/$prefix}"; do
+        [[ -d "$dir" && ! -L "$dir" ]] || continue
+        [[ -r "$dir" && -x "$dir" ]] || return 1
+        for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            name="${entry##*/}"
+            [[ -z "${seen[$name]:-}" ]] || continue
+            seen["$name"]=1
+            rel="${prefix:+$prefix/}${name}"
+            a="$root_a/$rel" b="$root_b/$rel"
+            kind_a=f kind_b=f
+            [[ -d "$a" && ! -L "$a" ]] && kind_a=d
+            [[ -d "$b" && ! -L "$b" ]] && kind_b=d
+            asb_is_excluded_path "$rel" "$kind_a" && continue
+            asb_is_excluded_path "$rel" "$kind_b" && continue
+            if [[ "$kind_a" == d && ( "$kind_b" == d || ( ! -e "$b" && ! -L "$b" ) ) ]] \
+                || [[ "$kind_b" == d && ! -e "$a" && ! -L "$a" ]]; then
+                asb_policy_diff "$root_a" "$root_b" "$rel" || return 1
+            elif [[ ! -e "$a" && ! -L "$a" ]]; then
+                printf 'Only in %s: %s\n' "${b%/*}" "$name"
+            elif [[ ! -e "$b" && ! -L "$b" ]]; then
+                printf 'Only in %s: %s\n' "${a%/*}" "$name"
+            elif [[ -L "$a" || -L "$b" ]]; then
+                if [[ ! -L "$a" || ! -L "$b" || "$(readlink "$a")" != "$(readlink "$b")" ]]; then
+                    printf 'Files %s and %s differ\n' "$a" "$b"
+                fi
+            elif [[ "$kind_a" != "$kind_b" ]]; then
+                printf 'Files %s and %s differ\n' "$a" "$b"
+            elif [[ -f "$a" && -f "$b" ]]; then
+                cmp -s -- "$a" "$b"
+                status=$?
+                if (( status == 1 )); then
+                    printf 'Files %s and %s differ\n' "$a" "$b"
+                elif (( status != 0 )); then
+                    return 1
+                fi
+            else
+                log_error "Cannot compare a special file in the settings snapshot"
+                return 1
+            fi
+        done
+    done
+}
 
 # Filter `diff -rq ROOT_A ROOT_B` output (stdin) down to what rsync would
 # transfer: drop lines inside an ASB_EXCLUDED_NESTED path of either root, and
@@ -751,7 +1183,7 @@ asb_filter_nested_diff() {
     local root_a="$1" root_b="$2" line x r parent keep
     while IFS= read -r line; do
         keep=true
-        for x in "${ASB_EXCLUDED_NESTED[@]}"; do
+        for x in "${ASB_EXCLUDED_NESTED[@]}" "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
             for r in "$root_a" "$root_b"; do
                 parent="$r"
                 [[ "$x" == */* ]] && parent="${r}/${x%/*}"
@@ -771,18 +1203,7 @@ asb_filter_nested_diff() {
 # True if a top-level entry name is excluded (used by the cp fallbacks, which
 # work one top-level entry at a time).
 asb_is_excluded_name() {
-    local name="$1" candidate
-    for candidate in "${ASB_EXCLUDED_DIRS[@]}"; do
-        [[ "$name" == "$candidate" ]] && return 0
-    done
-    for candidate in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
-        # shellcheck disable=SC2053 # the right-hand side is a glob on purpose
-        [[ "$name" == $candidate ]] && return 0
-    done
-    for candidate in "${ASB_EXCLUDED_NESTED[@]}"; do
-        [[ "$candidate" != */* && "$name" == "$candidate" ]] && return 0
-    done
-    return 1
+    asb_is_excluded_path "$1" d
 }
 
 # True if a top-level entry contains an excluded nested path (antigravity-cli).
@@ -790,7 +1211,7 @@ asb_is_excluded_name() {
 # lacks its excluded part, so that would destroy live data.
 asb_holds_nested_exclusion() {
     local name="$1" nested
-    for nested in "${ASB_EXCLUDED_NESTED[@]}"; do
+    for nested in "${ASB_EXCLUDED_NESTED[@]}" "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
         [[ "$nested" == */* && "${nested%%/*}" == "$name" ]] && return 0
     done
     return 1
@@ -856,7 +1277,6 @@ asb_report_credentials() {
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
     local -a left_out=() tracked=()
     local line
-    asb_includes_credentials && return 0
     is_json_output && return 0
     if [[ "$DRY_RUN" == "true" ]]; then
         while IFS= read -r line; do
@@ -877,6 +1297,27 @@ asb_report_credentials() {
         log_warn "${agent_name}: the backup still holds ${#tracked[@]} credential file(s) that an earlier asb copied; they are no longer updated: ${tracked[*]:0:5}"
         log_info "  'asb prune ${agent}' removes them in a new commit; earlier commits keep them until 'asb prune --reinit ${agent}'"
     fi
+    if (( ${#ASB_CONFIG_EXCLUDED_PATHS[@]} > 0 )); then
+        local -a specs=() configured_tracked=()
+        if is_dry_run; then
+            log_info "${DIM}[DRY RUN]${RESET} Additional excluded paths (relative to this agent's directory):"
+            for line in "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
+                printf '  %q\n' "$line" >&2
+            done
+        fi
+        for line in "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
+            specs+=(":(literal)$line")
+        done
+        if [[ -d "$dest/.git" ]]; then
+            while IFS= read -r -d '' line; do
+                configured_tracked+=("$line")
+            done < <(git -C "$dest" ls-files -z -- "${specs[@]}" 2>/dev/null)
+        fi
+        if (( ${#configured_tracked[@]} > 0 )); then
+            log_warn "${agent_name}: the backup still tracks ${#configured_tracked[@]} path(s) excluded by configuration; they are no longer updated"
+            log_info "  'asb prune ${agent}' removes these copies in a new commit; earlier history is unchanged"
+        fi
+    fi
     return 0
 }
 
@@ -888,15 +1329,18 @@ asb_excluded_pathspecs() {
         ASB_PRUNE_PATHSPECS+=(":(glob)**/${x}/**")
     done
     for x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
-        ASB_PRUNE_PATHSPECS+=(":(glob)**/${x}")
+        ASB_PRUNE_PATHSPECS+=(":(glob)**/${x}" ":(glob)**/${x}/**")
     done
     for x in "${ASB_EXCLUDED_NESTED[@]}"; do
         ASB_PRUNE_PATHSPECS+=(":(glob)${x}/**")
     done
+    for x in "${ASB_CONFIG_EXCLUDED_PATHS[@]}"; do
+        ASB_PRUNE_PATHSPECS+=(":(literal)${x}")
+    done
 }
 
-# Remove policy-excluded paths below the top level of a backup directory.
-# Only the cp fallback needs this; rsync applies the same rules itself.
+# Remove policy-excluded paths from an existing tree. Copy/restore operations
+# filter before copying and do not use post-copy scrubbing for protection.
 asb_strip_excluded() {
     local dir="$1" x
     local -a find_args=()
@@ -927,7 +1371,7 @@ asb_strip_excluded() {
 
 backup_agent() {
     local agent="$1"
-    asb_use_policy "$agent"
+    asb_use_policy "$agent" || return 1
     local source
     local dest
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
@@ -950,24 +1394,19 @@ backup_agent() {
             log_info "${DIM}[DRY RUN]${RESET} Source: ${source}"
             log_info "${DIM}[DRY RUN]${RESET} Destination: ${dest}"
 
-            if command_exists rsync; then
-                if [[ -d "$dest" ]]; then
-                    local changes
-                    changes=$(rsync -a --delete --checksum --dry-run --itemize-changes \
-                        "${ASB_RSYNC_EXCLUDES[@]}" \
-                        "$source/" "$dest/" 2>/dev/null | head -30)
-
-                    if [[ -n "$changes" ]]; then
-                        log_info "${DIM}[DRY RUN]${RESET} Files that would be synced:"
-                        echo "$changes" | while IFS= read -r line; do
-                            echo "  $line" >&2
-                        done
-                    else
-                        log_info "${DIM}[DRY RUN]${RESET} No file changes detected"
-                    fi
-                else
-                    log_info "${DIM}[DRY RUN]${RESET} Destination does not exist; all files would be copied"
-                fi
+            local changes line
+            if ! changes=$(asb_policy_diff "$dest" "$source"); then
+                log_error "Could not preview the backup"
+                BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"preview_failed\"}"
+                return 1
+            fi
+            if [[ -n "$changes" ]]; then
+                log_info "${DIM}[DRY RUN]${RESET} Files that would be synced (excluded paths omitted):"
+                while IFS= read -r line; do
+                    printf '  %s\n' "$line" >&2
+                done < <(printf '%s\n' "$changes" | head -30)
+            else
+                log_info "${DIM}[DRY RUN]${RESET} No file changes detected"
             fi
             asb_report_credentials "$agent" "$source" "$dest"
 
@@ -997,10 +1436,17 @@ backup_agent() {
     fi
 
     # Create backup directory if needed
-    mkdir -p "$dest"
+    if [[ -L "$dest" ]] || ! mkdir -p "$dest"; then
+        log_error "Cannot safely create the backup directory"
+        BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"destination_failed\"}"
+        return 1
+    fi
 
     # Initialize git repo if needed
-    init_git_repo "$dest" "$agent"
+    if ! init_git_repo "$dest" "$agent"; then
+        BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"init_failed\"}"
+        return 1
+    fi
 
     # Sync files using rsync for efficiency
     local needs_fallback=false
@@ -1019,44 +1465,46 @@ backup_agent() {
     fi
 
     if [[ "$needs_fallback" == "true" ]]; then
-        # Fallback to cp
-        # First, remove files that no longer exist in source (except .git and .gitignore)
-        find "$dest" -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.gitignore' -exec rm -rf {} \; 2>/dev/null
-        # Preserve backup's .git before cp (source might overwrite it)
-        local git_preserved=false
-        if [[ -d "$dest/.git" ]]; then
-            mv "$dest/.git" "$dest/.git.asb_preserve" 2>/dev/null && git_preserved=true
+        # Finish a filtered snapshot before deleting any stale backup files.
+        # Never copy secrets first and scrub them afterwards, and leave legacy
+        # excluded copies in place for explicit `prune`, just as rsync does.
+        local stage
+        if ! stage=$(mktemp -d 2>/dev/null || mktemp -d -t asb-backup.XXXXXXXX); then
+            BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"staging_failed\"}"
+            return 1
         fi
-        # Copy top-level entries individually so excluded data dirs
-        # (sessions, file-history, ...) stay out of the backup, matching
-        # the rsync exclusion policy.
-        local _entry _name
-        for _entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
-            [[ -e "$_entry" || -L "$_entry" ]] || continue
-            _name="$(basename "$_entry")"
-            [[ "$_name" == ".git" || "$_name" == ".gitignore" ]] && continue
-            asb_is_excluded_name "$_name" && continue
-            cp -r "$_entry" "$dest/" 2>/dev/null || true
-        done
-        # Remove any .git that came from source
-        rm -rf "$dest/.git" 2>/dev/null || true
-        # Restore backup's preserved .git
-        if [[ "$git_preserved" == "true" ]]; then
-            mv "$dest/.git.asb_preserve" "$dest/.git" 2>/dev/null || true
+        if ! asb_copy_filtered "$source" "$stage"; then
+            rm -rf -- "$stage"
+            log_error "Could not stage the permitted settings for backup"
+            BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"staging_failed\"}"
+            return 1
         fi
-        # The loop above filters top-level names only; drop deeper excluded
-        # paths too, so the fallback produces what rsync would.
-        asb_strip_excluded "$dest"
+        if ! asb_sync_filtered "$stage" "$dest"; then
+            rm -rf -- "$stage"
+            log_error "Could not synchronize the backup; no backup commit was created"
+            BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"copy_failed\"}"
+            return 1
+        fi
+        rm -rf -- "$stage"
     fi
 
     # Create commit if auto-commit is enabled
     local hook_commit=""
     local commit_created=false
     if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
-        create_backup_commit "$dest" "$agent"
+        if ! create_backup_commit "$dest" "$agent"; then
+            BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"commit_failed\"}"
+            return 1
+        fi
         hook_commit="$LAST_BACKUP_COMMIT"
         [[ -n "$hook_commit" ]] && commit_created=true
     else
+        # The manual-commit workflow still stages settings and sanitizes any
+        # pre-staged private paths; disabling commits must not disable policy.
+        if ! asb_stage_allowed_changes "$dest" "$agent"; then
+            BACKUP_AGENT_RESULT="{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"staging_failed\"}"
+            return 1
+        fi
         hook_commit=$(git -C "$dest" rev-parse --short HEAD 2>/dev/null || echo "")
     fi
 
@@ -1169,6 +1617,65 @@ backup_all() {
 # RESTORE OPERATIONS
 #==============================================================================
 
+# Extract only permitted paths from an immutable commit. Exclusion happens in
+# Git, before a legacy credential blob can reach the archive or temporary
+# directory. A subshell keeps temporary-file cleanup local to this operation.
+asb_archive_filtered() (
+    local backup_dir="$1" commit="$2" dest="$3" work listing metadata objects path spec magic
+    local has_files=false
+    local -a pathspecs=(. ':(exclude,glob)**/.gitignore' ':(exclude,glob)**/.gitignore/**')
+    commit=$(git -C "$backup_dir" rev-parse --verify --end-of-options "${commit}^{commit}" 2>/dev/null) || return 1
+    work=$(mktemp -d 2>/dev/null || mktemp -d -t asb-tree.XXXXXXXX) || return 1
+    trap 'rm -rf -- "${work:?}"' EXIT
+    listing="$work/paths"
+    if ! git -C "$backup_dir" ls-tree -r --name-only -z "$commit" > "$listing" 2>/dev/null; then
+        return 1
+    fi
+    while IFS= read -r -d '' path; do
+        if ! asb_is_excluded_path "$path" f; then
+            has_files=true
+            break
+        fi
+    done < "$listing"
+    # `git archive` rejects pathspecs when they select an empty tree. An
+    # entirely excluded snapshot is valid and has no files to extract.
+    [[ "$has_files" == "true" ]] || return 0
+
+    asb_excluded_pathspecs
+    for spec in "${ASB_PRUNE_PATHSPECS[@]}"; do
+        magic="${spec%%)*}"
+        pathspecs+=(":(exclude,${magic#':('})${spec#*)}")
+    done
+
+    # Restore the committed bytes, not an export transformed by a backed-up
+    # .gitattributes file. Isolated bare metadata borrows the object database
+    # without changing the backup's config, attributes, index or working tree.
+    # --worktree-attributes consults a private empty working directory rather than
+    # loading attributes (possibly an excluded file) from the selected commit.
+    objects=$(cd -- "$backup_dir" && cd -- "$(git rev-parse --git-path objects)" && pwd -P) || return 1
+    metadata="$work/repository.git"
+    local -a init_args=(init -q --bare --template=)
+    if [[ "$(git -C "$backup_dir" rev-parse --show-object-format 2>/dev/null)" == sha256 ]]; then
+        init_args+=(--object-format=sha256)
+    fi
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        git -c init.defaultBranch=main "${init_args[@]}" "$metadata" 2>/dev/null || return 1
+    mkdir -p "$metadata/info" "$work/attributes" || return 1
+    # Git's alternates file accepts C-quoted absolute paths, including spaces,
+    # quotes, backslashes and control characters in a backup root.
+    objects="${objects//\\/\\\\}"
+    objects="${objects//\"/\\\"}"
+    objects="${objects//$'\n'/\\n}"
+    objects="${objects//$'\r'/\\r}"
+    objects="${objects//$'\t'/\\t}"
+    printf '"%s"\n' "$objects" > "$metadata/objects/info/alternates" || return 1
+    printf '* -export-ignore -export-subst\n' > "$metadata/info/attributes" || return 1
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+        git -C "$work/attributes" --git-dir="$metadata" --work-tree="$work/attributes" -c core.attributesFile=/dev/null \
+        archive --worktree-attributes --format=tar "$commit" -- "${pathspecs[@]}" 2>/dev/null \
+        | tar -C "$dest" -xf - 2>/dev/null
+)
+
 show_restore_preview() {
     local backup_dir="$1"
     local current_dir="$2"
@@ -1194,20 +1701,17 @@ show_restore_preview() {
     printf "Message: %s\n" "${commit_msg:-unknown}" >&2
     printf '\n' >&2
 
-    # Extract backup to temp for comparison
-    local temp_backup
-    temp_backup=$(mktemp -d)
-    local prev_trap
-    prev_trap=$(trap -p RETURN)
-    if [[ -z "$prev_trap" ]]; then
-        prev_trap="trap - RETURN"
-    fi
-    # shellcheck disable=SC2064 # Variables intentionally expand at definition time
-    trap "rm -rf '$temp_backup'; $prev_trap" RETURN
-
-    if ! git -C "$backup_dir" archive "$commit" 2>/dev/null | tar -C "$temp_backup" -xf - 2>/dev/null; then
-        log_warn "Could not extract backup for preview"
-        return 1
+    # Restore passes its already-filtered snapshot; direct callers can request
+    # a preview without creating any copy of excluded historical files.
+    local temp_backup="${5:-}" own_snapshot=false
+    if [[ -z "$temp_backup" ]]; then
+        temp_backup=$(mktemp -d 2>/dev/null || mktemp -d -t asb-preview.XXXXXXXX) || return 1
+        own_snapshot=true
+        if ! asb_archive_filtered "$backup_dir" "$commit" "$temp_backup"; then
+            rm -rf -- "${temp_backup:?}"
+            log_warn "Could not extract backup for preview"
+            return 1
+        fi
     fi
 
     # Check if current dir exists
@@ -1215,6 +1719,7 @@ show_restore_preview() {
         printf "Target %s does not exist.\n" "$current_dir" >&2
         printf "Will create directory with backup contents.\n" >&2
         RESTORE_HAS_CHANGES=true
+        [[ "$own_snapshot" == "true" ]] && rm -rf -- "${temp_backup:?}"
         return 0
     fi
 
@@ -1228,9 +1733,12 @@ show_restore_preview() {
 
     # Get diff output
     local diff_output
-    diff_output=$(diff -rq "$current_dir" "$temp_backup" \
-        "${ASB_DIFF_EXCLUDES[@]}" \
-        2>/dev/null | asb_filter_nested_diff "$current_dir" "$temp_backup" || true)
+    if ! diff_output=$(asb_policy_diff "$current_dir" "$temp_backup"); then
+        [[ "$own_snapshot" == "true" ]] && rm -rf -- "${temp_backup:?}"
+        log_error "Could not compare permitted files for restore"
+        return 1
+    fi
+    [[ "$own_snapshot" == "true" ]] && rm -rf -- "${temp_backup:?}"
 
     if [[ -z "$diff_output" ]]; then
         printf '  %s(no differences detected)%s\n' "$DIM" "$RESET" >&2
@@ -1339,9 +1847,9 @@ confirm_restore() {
     esac
 }
 
-restore_agent() {
+restore_agent() (
     local agent="$1"
-    asb_use_policy "$agent"
+    asb_use_policy "$agent" || return 1
     local commit_ref="${2:-HEAD}"
     local source
     local dest
@@ -1362,14 +1870,13 @@ restore_agent() {
     fi
 
     # Resolve tag names to commits
-    if git -C "$source" rev-parse --verify "refs/tags/${commit_ref}" >/dev/null 2>&1; then
-        commit=$(git -C "$source" rev-parse "refs/tags/${commit_ref}")
+    if commit=$(git -C "$source" rev-parse --verify --end-of-options "refs/tags/${commit_ref}^{commit}" 2>/dev/null); then
         is_tag=true
         if ! is_json_output; then
             log_info "Restoring from tag '${commit_ref}'"
         fi
-    elif git -C "$source" rev-parse --verify "$commit_ref" >/dev/null 2>&1; then
-        commit=$(git -C "$source" rev-parse "$commit_ref")
+    elif commit=$(git -C "$source" rev-parse --verify --end-of-options "${commit_ref}^{commit}" 2>/dev/null); then
+        :
     else
         if is_json_output; then
             json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"invalid_commit_or_tag\",\"ref\":\"$(json_escape_string "$commit_ref")\"}"
@@ -1381,33 +1888,55 @@ restore_agent() {
         return 1
     fi
 
+    if [[ -L "$dest" || ( -e "$dest" && ! -d "$dest" ) ]]; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"unsafe_destination\"}"
+        else
+            log_error "Restore destination must be a directory, not a file or symlink: ${dest}"
+        fi
+        return 1
+    fi
+
+    # Extract a filtered, immutable snapshot before any live-path changes.
+    # Never checkout inside the backup: that would alter its working tree and
+    # index, and could put a legacy credential back into either of them.
+    local snapshot
+    snapshot=$(mktemp -d 2>/dev/null || mktemp -d -t asb-restore.XXXXXXXX) || {
+        log_error "Could not create restore snapshot directory"
+        return 1
+    }
+    trap 'rm -rf -- "${snapshot:?}"' EXIT
+    if ! asb_archive_filtered "$source" "$commit" "$snapshot"; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"snapshot_failed\"}"
+        else
+            log_error "Could not extract permitted backup files; nothing was restored"
+        fi
+        return 1
+    fi
+
     # Show preview (works in both normal and dry-run mode, but skip in JSON mode)
     if ! is_json_output; then
-        if ! show_restore_preview "$source" "$dest" "$commit" "$agent_name"; then
+        if ! show_restore_preview "$source" "$dest" "$commit" "$agent_name" "$snapshot"; then
             log_error "Could not generate restore preview"
             return 1
         fi
     else
-        # In JSON mode, we still need to check if there are changes
-        local temp_backup
-        temp_backup=$(mktemp -d)
-        # shellcheck disable=SC2064 # Variable intentionally expands at definition time
-        trap "rm -rf '$temp_backup'" RETURN
-
-        if git -C "$source" archive "$commit" 2>/dev/null | tar -C "$temp_backup" -xf - 2>/dev/null; then
-            if [[ -d "$dest" ]]; then
-                local diff_output
-                diff_output=$(diff -rq "$dest" "$temp_backup" \
-                    "${ASB_DIFF_EXCLUDES[@]}" 2>/dev/null \
-                    | asb_filter_nested_diff "$dest" "$temp_backup" || true)
-                if [[ -n "$diff_output" ]]; then
-                    RESTORE_HAS_CHANGES=true
-                else
-                    RESTORE_HAS_CHANGES=false
-                fi
-            else
-                RESTORE_HAS_CHANGES=true
+        # JSON previews use the same snapshot and the same read policy.
+        RESTORE_HAS_CHANGES=false
+        if [[ -d "$dest" ]]; then
+            local diff_output
+            if ! diff_output=$(asb_policy_diff "$dest" "$snapshot"); then
+                json_output "{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"preview_failed\"}"
+                return 1
             fi
+            if [[ -n "$diff_output" ]]; then
+                RESTORE_HAS_CHANGES=true
+            else
+                RESTORE_HAS_CHANGES=false
+            fi
+        else
+            RESTORE_HAS_CHANGES=true
         fi
     fi
 
@@ -1465,19 +1994,17 @@ restore_agent() {
         log_debug "Commit: ${commit}"
     fi
 
-    # Create destination if needed
-    mkdir -p "$dest"
-
-    # If restoring a specific commit, checkout that commit first
-    if [[ "$commit" != "HEAD" ]]; then
-        git -C "$source" checkout "$commit" -- . >/dev/null 2>&1 || {
-            if is_json_output; then
-                json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"checkout_failed\",\"commit\":\"$(json_escape_string "$commit")\"}"
-            else
-                log_error "Failed to checkout commit: ${commit}"
-            fi
-            return 1
-        }
+    # A pre-restore hook can change the destination. Recheck before rsync or
+    # mkdir follows it; the fallback also checks every child before writing.
+    if [[ -L "$dest" || ( -e "$dest" && ! -d "$dest" ) ]] \
+        || ! asb_sync_preflight "$snapshot" "$dest" \
+        || ! mkdir -p -- "$dest"; then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"unsafe_destination\"}"
+        else
+            log_error "Could not prepare a safe restore destination: ${dest}"
+        fi
+        return 1
     fi
 
     # Sync files
@@ -1488,7 +2015,7 @@ restore_agent() {
         # can never wipe live session data, caches, or edit history.
         if ! rsync -a --delete --checksum \
             "${ASB_RSYNC_EXCLUDES[@]}" \
-            "$source/" "$dest/" 2>/dev/null; then
+            "$snapshot/" "$dest/" 2>/dev/null; then
             if ! is_json_output; then
                 log_warn "rsync failed; falling back to cp"
             fi
@@ -1500,55 +2027,14 @@ restore_agent() {
     fi
 
     if [[ "$needs_fallback" == "true" ]]; then
-        # Copy the backup through a staging dir stripped by the same policy,
-        # so a backup made before an exclusion existed cannot overwrite live
-        # session data with older copies (rsync never touches excluded paths).
-        # Stage first: without it there is no safe restore, so refuse before
-        # touching anything live.
-        local _stage _entry _name _staged=false
-        if _stage=$(mktemp -d 2>/dev/null || mktemp -d -t asb-restore.XXXXXXXX); then
-            _staged=true
-            for _entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
-                [[ -e "$_entry" || -L "$_entry" ]] || continue
-                _name="$(basename "$_entry")"
-                [[ "$_name" == ".git" || "$_name" == ".gitignore" ]] && continue
-                asb_is_excluded_name "$_name" && continue
-                cp -r "$_entry" "$_stage/" 2>/dev/null || _staged=false
-            done
-        fi
-        if [[ "$_staged" != "true" ]]; then
-            [[ -n "${_stage:-}" && -d "$_stage" ]] && rm -rf "${_stage:?}" 2>/dev/null
-            [[ "$commit" != "HEAD" ]] && git -C "$source" checkout HEAD -- . >/dev/null 2>&1
+        if ! asb_sync_filtered "$snapshot" "$dest"; then
             if is_json_output; then
-                json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"staging_failed\"}"
+                json_output "{\"agent\":\"${agent}\",\"name\":\"$(json_escape_string "$agent_name")\",\"status\":\"error\",\"error\":\"restore_failed\"}"
             else
-                log_error "Could not stage the backup for the cp fallback; nothing was restored"
+                log_error "Could not restore all permitted files; backup history was left unchanged"
             fi
             return 1
         fi
-        asb_strip_excluded "$_stage"
-
-        # Remove existing files, but NEVER live data dirs that are excluded
-        # from backups (sessions, file-history, ...): the backup does not
-        # contain them, so deleting them here would destroy live data.
-        for _entry in "$dest"/* "$dest"/.[!.]* "$dest"/..?*; do
-            [[ -e "$_entry" || -L "$_entry" ]] || continue
-            _name="$(basename "$_entry")"
-            asb_is_excluded_name "$_name" && continue
-            # Holds live data the backup excludes (antigravity-cli/conversations,
-            # a profile's credential file): merge over it below instead of
-            # deleting it.
-            asb_holds_nested_exclusion "$_name" && continue
-            asb_holds_credentials "$_entry" && continue
-            rm -rf "$_entry" 2>/dev/null
-        done
-        cp -r "$_stage"/. "$dest/" 2>/dev/null || true
-        rm -rf "${_stage:?}" 2>/dev/null
-    fi
-
-    # Reset to HEAD if we checked out a specific commit
-    if [[ "$commit" != "HEAD" ]]; then
-        git -C "$source" checkout HEAD -- . >/dev/null 2>&1
     fi
 
     run_hooks "post-restore" "$agent" "$commit" || true
@@ -1568,7 +2054,7 @@ restore_agent() {
         log_success "Restored ${agent_name} from backup"
     fi
     return 0
-}
+)
 
 #==============================================================================
 # EXPORT / IMPORT
@@ -2467,7 +2953,7 @@ show_history() {
 
 show_diff() {
     local agent="$1"
-    asb_use_policy "$agent"
+    asb_use_policy "$agent" || return 1
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
     local source
     local dest
@@ -2493,25 +2979,17 @@ show_diff() {
         return 1
     fi
 
-    # Create a temp copy of current state
-    local temp_dir
-    temp_dir=$(mktemp -d)
-    local prev_trap
-    prev_trap=$(trap -p RETURN)
-    if [[ -z "$prev_trap" ]]; then
-        prev_trap="trap - RETURN"
-    fi
-    # shellcheck disable=SC2064 # Variables intentionally expand at definition time
-    trap "rm -rf '$temp_dir'; $prev_trap" RETURN
-
-    # Copy current source to temp (use /. to include hidden files)
-    cp -r "$source"/. "$temp_dir/" 2>/dev/null || true
-
-    # Compare with backup
+    # Compare only permitted paths in place. In particular, do not make a
+    # temporary copy of the live credentials just to hide them from diff.
     local diff_output
-    diff_output=$(diff -rq "$dest" "$temp_dir" \
-        "${ASB_DIFF_EXCLUDES[@]}" \
-        2>/dev/null | asb_filter_nested_diff "$dest" "$temp_dir" || true)
+    if ! diff_output=$(asb_policy_diff "$dest" "$source"); then
+        if is_json_output; then
+            json_output "{\"agent\":\"${agent}\",\"status\":\"error\",\"error\":\"comparison_failed\"}"
+        else
+            log_error "Could not compare permitted files for ${agent_name}"
+        fi
+        return 1
+    fi
 
     if is_json_output; then
         local added=()
@@ -2522,15 +3000,17 @@ show_diff() {
             [[ -z "$line" ]] && continue
             if [[ "$line" == "Only in $dest"* ]]; then
                 # File only in backup (will be added on restore / was deleted)
-                local file="${line#Only in "$dest"}"
-                file="${file#/: }"
-                file="${file#: }"
+                local rest="${line#Only in }" dir file
+                dir="${rest%%: *}"
+                file="${rest#*: }"
+                [[ "$dir" == "$dest" ]] || file="${dir#"$dest"/}/${file}"
                 removed+=("\"$(json_escape_string "$file")\"")
-            elif [[ "$line" == "Only in $temp_dir"* ]]; then
+            elif [[ "$line" == "Only in $source"* ]]; then
                 # File only in current (new file)
-                local file="${line#Only in "$temp_dir"}"
-                file="${file#/: }"
-                file="${file#: }"
+                local rest="${line#Only in }" dir file
+                dir="${rest%%: *}"
+                file="${rest#*: }"
+                [[ "$dir" == "$source" ]] || file="${dir#"$source"/}/${file}"
                 added+=("\"$(json_escape_string "$file")\"")
             elif [[ "$line" == "Files "* && "$line" == *" differ" ]]; then
                 # File differs
@@ -3772,10 +4252,24 @@ init_config() {
 # ASB_INCLUDE_CREDENTIALS=false
 
 #-----------------------------------------------------------------------------
-# FUTURE OPTIONS (not yet implemented)
+# ADDITIONAL EXCLUDED PATHS
 #-----------------------------------------------------------------------------
-# Custom exclusion patterns, agent definitions, etc. will go here
-# as asb evolves. See: https://github.com/Dicklesworthstone/agent_settings_backup_script
+# Literal paths relative to each agent's directory, one per line. A directory
+# excludes its whole subtree. Spaces and glob characters are literal; these
+# are not .gitignore patterns. Empty lines are ignored, a final / is optional.
+# Absolute paths, '.', '..', empty components and Git metadata are rejected.
+# These rules ADD to the defaults, even when ASB_INCLUDE_CREDENTIALS=true.
+# They apply to backup, diff, dry runs, Git staging, prune and restore.
+#
+# ASB_EXCLUDE_PATHS=$'private/token-store.json\nlocal secrets/'
+# ASB_AGENT_EXCLUDE_PATHS[claude]=$'mcp/private-settings.json'
+# ASB_AGENT_EXCLUDE_PATHS[myagent]=$'profiles/work/session-token'
+#
+# Use the custom agent's identifier from ~/.config/asb/custom_agents. Put
+# persistent rules here for scheduled backups; environment values apply only
+# to processes that inherit them. Existing tracked copies remain unchanged
+# until `asb prune <agent>` removes them in a new commit, without rewriting
+# history. Keys embedded in otherwise permitted settings are not redacted.
 CONFIGEOF
 
     log_success "Created config file: $config_file"
@@ -3807,6 +4301,11 @@ show_config() {
     printf "%-20s %s\n" "ASB_AUTO_COMMIT:" "${ASB_AUTO_COMMIT:-true}" >&2
     printf "%-20s %s\n" "ASB_VERBOSE:" "${ASB_VERBOSE:-false}" >&2
     printf "%-20s %s\n" "ASB_INCLUDE_CREDENTIALS:" "${ASB_INCLUDE_CREDENTIALS:-false}" >&2
+    printf '%-20s %q\n' "ASB_EXCLUDE_PATHS:" "${ASB_EXCLUDE_PATHS:-}" >&2
+    local agent
+    for agent in "${!ASB_AGENT_EXCLUDE_PATHS[@]}"; do
+        printf 'ASB_AGENT_EXCLUDE_PATHS[%s]: %q\n' "$agent" "${ASB_AGENT_EXCLUDE_PATHS[$agent]}" >&2
+    done
     printf '\n' >&2
 
     # Show source of each value (helpful for debugging)
@@ -4347,8 +4846,15 @@ ${BOLD}ENVIRONMENT${RESET}
     ASB_INCLUDE_CREDENTIALS
                           Back up login tokens and API key files (.credentials.json,
                           auth.json, oauth_creds.json, .env, ...) too (default: false)
+    ASB_EXCLUDE_PATHS     Additional literal paths relative to each agent's root,
+                          one per line (files or whole directories; no glob syntax)
 
     Tip: Use 'asb config init' to create a persistent config file.
+    The config also accepts ASB_AGENT_EXCLUDE_PATHS[agent] for rules applying
+    only to that built-in or custom agent. All extra rules extend the defaults,
+    even with ASB_INCLUDE_CREDENTIALS=true, and protect live paths on restore.
+    Existing tracked excluded copies are not updated or automatically deleted;
+    'asb prune <agent>' removes them in a new commit without rewriting history.
 
 ${BOLD}SAFETY${RESET}
     The restore command shows a preview of changes and requires confirmation
@@ -4412,7 +4918,7 @@ asb_kib_human() {
 # Sets PRUNE_AGENT_RESULT (JSON object).
 prune_agent() {
     local agent="$1" reinit="$2"
-    asb_use_policy "$agent"
+    asb_use_policy "$agent" || return 1
     local agent_name="${AGENT_NAMES[$agent]:-$agent}"
     local jname dest
     jname=$(json_escape_string "$agent_name")
@@ -4505,11 +5011,16 @@ prune_agent() {
             PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"changed_since_inspection\",${fields}}"
             return 1
         fi
-        # No auto maintenance on this commit: a detached `git maintenance run
-        # --auto` would repack the old history while the reinit's gc does too.
-        if ! git -C "$dest" rm -r -q --ignore-unmatch -- "${ASB_PRUNE_PATHSPECS[@]}" >/dev/null 2>&1 \
-            || ! git -C "$dest" -c gc.auto=0 -c maintenance.auto=false \
-                commit -q -m "Prune ${agent_name}: remove ${count} path(s) excluded by the backup policy" >/dev/null 2>&1; then
+        # Commit only the removed policy paths, preserving unrelated staged
+        # settings in the index. No auto maintenance on this commit: a detached
+        # `git maintenance run --auto` would race the reinit's gc below.
+        # NUL-delimited stdin keeps literal names intact and avoids argv limits
+        # when pruning a large session-data directory from a legacy backup.
+        if ! printf '%s\0' "${paths[@]}" | git -C "$dest" --literal-pathspecs rm -r -q --ignore-unmatch \
+                --pathspec-from-file=- --pathspec-file-nul >/dev/null 2>&1 \
+            || ! printf '%s\0' "${paths[@]}" | git -C "$dest" --literal-pathspecs -c gc.auto=0 -c maintenance.auto=false \
+                commit -q -m "Prune ${agent_name}: remove ${count} path(s) excluded by the backup policy" \
+                    --only --pathspec-from-file=- --pathspec-file-nul >/dev/null 2>&1; then
             is_json_output || log_error "${agent_name}: failed to remove excluded paths"
             PRUNE_AGENT_RESULT="{\"agent\":\"${agent}\",\"name\":\"${jname}\",\"status\":\"error\",\"error\":\"remove_failed\",${fields}}"
             return 1
@@ -4630,9 +5141,11 @@ main() {
     if ! load_config; then
         exit 1
     fi
-    # The config may set ASB_INCLUDE_CREDENTIALS.
+    # Reject malformed exclusions before any lock, copy, restore or pruning.
+    asb_validate_exclusion_config || exit 1
+    # The config may set credential inclusion and additional exclusions.
     asb_build_shared_policy
-    asb_use_policy
+    asb_use_policy || exit 1
 
     # Load custom agents from config
     load_custom_agents

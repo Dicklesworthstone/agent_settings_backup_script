@@ -340,6 +340,56 @@ Environment variables:
 | `ASB_VERBOSE` | `false` | Verbose output |
 | `ASB_LOCK_WAIT` | `300` | Seconds a backup, restore, import, tag or prune waits while another asb writes the same agent's backup |
 | `ASB_INCLUDE_CREDENTIALS` | `false` | Back up and restore login tokens and API key files too (see [FAQ](#faq)) |
+| `ASB_EXCLUDE_PATHS` | empty | Additional literal paths to exclude from every agent, separated by newlines |
+
+### Path Exclusions
+
+Known credential filenames are excluded by default, including `.credentials.json`
+and `auth.json` at any depth. Add paths for other private files or directories in
+`~/.config/asb/config`:
+
+```bash
+# Apply to every built-in and custom agent.
+ASB_EXCLUDE_PATHS=$'private/token.txt\nprofiles/work/account.json'
+
+# Add exclusions for one agent. Use its built-in name or custom-agent key.
+ASB_AGENT_EXCLUDE_PATHS[claude]=$'mcp/private.env\nlocal accounts'
+ASB_AGENT_EXCLUDE_PATHS[work]='account-token.json'
+```
+
+`ASB_AGENT_EXCLUDE_PATHS` is an associative array supplied by asb; assign its
+entries directly in the config file. The global list can also be set in the
+environment for one invocation:
+
+```bash
+ASB_EXCLUDE_PATHS=$'private/token.txt\n.env.production' asb backup claude codex
+```
+
+Each path is relative to that agent's source directory. For example,
+`profiles/work/account.json` excludes that exact path below `~/.claude` for
+Claude, and below the mapped profile directory for a custom agent. A directory
+entry excludes its entire subtree. Paths are literal: spaces and characters such
+as `*`, `?`, and `[` are part of the filename, not wildcard syntax. Use newlines
+between entries; blank lines are ignored and a trailing `/` is optional.
+Absolute paths, `.` or `..` components, repeated `/`, tabs, carriage returns,
+and `.git` or `.gitignore` components are rejected before an operation proceeds.
+
+These lists extend the defaults. Setting `ASB_INCLUDE_CREDENTIALS=true` enables
+the built-in credential filenames, but does not override an explicit path
+exclusion. Put persistent exclusions in the config file so scheduled backups
+load the same policy.
+
+The policy applies before copying, including nested files in the `cp` fallback.
+It also governs backup previews, `diff`, Git staging, `prune`, and restoration
+from any commit or tag. Restore preserves excluded live files and directories;
+it does not replace them with older copies from backup history. A type conflict
+that would replace a directory holding excluded data is refused. Restore reads a
+filtered snapshot without changing the backup repository's working tree or index.
+
+Exclusions are based on paths, not file contents. A secret embedded in an otherwise
+allowed settings file is still backed up; exclude that whole file if needed.
+Adding a `.gitignore` rule alone does not prevent copying or protect a file
+already tracked by Git. See the [credential FAQ](#faq) for existing backups.
 
 ## Hooks
 
@@ -545,13 +595,18 @@ git config --global --add safe.directory ~/.agent_settings_backups/.claude
 Run `asb backup <agent>` first to create the initial backup before exporting.
 
 **Large backup size**
-Certain agents store cache files or large binary data. Add exclusions to `.gitignore`:
+Certain agents store additional cache files or large binary data. Add their
+paths to the agent's exclusions in `~/.config/asb/config` to prevent future
+copies and commits:
+
 ```bash
-echo "*.cache" >> ~/.agent_settings_backups/.claude/.gitignore
-echo "cache/" >> ~/.agent_settings_backups/.claude/.gitignore
-git -C ~/.agent_settings_backups/.claude add .gitignore
-git -C ~/.agent_settings_backups/.claude commit -m "Add cache exclusions"
+ASB_AGENT_EXCLUDE_PATHS[claude]=$'large-cache\nmodels/downloads'
 ```
+
+Then inspect existing tracked copies with `asb --dry-run prune claude`. A normal
+`asb prune claude` removes excluded tracked files in a new commit; old history
+still occupies space. See [Path Exclusions](#path-exclusions) and the pruning FAQ
+before choosing whether to discard any history.
 
 ### Debug Mode
 
@@ -574,7 +629,7 @@ asb --dry-run restore claude
 ## Requirements
 
 - Bash 4 or later (required). On macOS install it with `brew install bash`; asb finds it even when cron or launchd start it with the system Bash 3.2.
-- `git` (required)
+- Git 2.26 or later (required for safe, NUL-delimited path lists when staging or pruning)
 - `rsync` (recommended, falls back to `cp`)
 - `curl` or `wget` (for installation)
 - `sha256sum` or `shasum` (for release verification during installation)
@@ -601,9 +656,31 @@ A: Use `asb export <agent> backup.tar.gz` on the source machine, copy the file, 
 A: asb backs up settings, not session data. Excluded everywhere: logs (`*.log`, rotated `*.log.1`… and `*.log.gz`), caches (`cache/`, `Cache/`, `.cache/`), session transcripts and edit history (`sessions/`, `archived_sessions/`, `file-history/`, `projects/`, `downloads/`, `shell-snapshots/`), SQLite write-ahead sidecars (`*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite3-wal`, `*.sqlite3-shm`, `*.db-wal`, `*.db-shm`), Codex's session databases (`thread_history_*.sqlite`, `logs_*.sqlite`, `db-backups/`), and `node_modules/` (installed npm packages; `package.json` is kept). Excluded only at the top of an agent's folder: `tmp/` (Gemini CLI keeps per-project chats and logs there), Antigravity's `antigravity-cli/conversations/` and `antigravity-cli/brain/` under `~/.gemini`, and the server binaries Codex downloads for itself (`packages/app-server-daemon/`, `plugins/.plugin-appserver/`). Per agent: OpenCode's and Factory's `bin/` (their own installed binaries), Claude Code's `jobs/` (background-job state and scratch), and Codex's `computer-use/` (the macOS app it downloads). A `bin/` you keep in `~/.claude` is still backed up. Restore never deletes any of these from the live folder.
 
 **Q: Are my login tokens and API keys backed up?**
-A: No, not by default. These files are left out at any depth, for built-in and custom agents alike: `.credentials.json` (Claude Code on Linux and WSL), `auth.json` (Codex CLI), `oauth_creds.json` and `oauth_credentials.json` (Gemini CLI, Qwen Code), `mcp-oauth-tokens.json` (Gemini CLI's MCP logins), `application_default_credentials.json` (Google Cloud), `.env`, `*.keychain` and `*.keychain-db`. The rule covers rsync and the `cp` fallback alike, and `asb backup --dry-run` lists the files it leaves out (names only). Restore never deletes or overwrites a live credential file, and it does not bring back one that an older backup holds, because a saved OAuth token has usually been rotated by then. API keys written into a settings file (an MCP server's `env` block in `settings.json`, say) are part of that file and are still backed up. To back up and restore credential files as well, set `ASB_INCLUDE_CREDENTIALS=true` in the environment or the config file.
+A: Known credential files are excluded by default at any depth, for built-in and
+custom agents alike: `.credentials.json` (Claude Code on Linux and WSL),
+`auth.json` (Codex CLI), `oauth_creds.json` and `oauth_credentials.json` (Gemini
+CLI, Qwen Code), `mcp-oauth-tokens.json` (Gemini CLI's MCP logins),
+`application_default_credentials.json` (Google Cloud), `.env`, `*.keychain` and
+`*.keychain-db`. The rule covers rsync and the `cp` fallback, and
+`asb backup --dry-run` lists skipped credential paths without displaying their
+contents. Restore preserves live credential files and does not restore their
+older versions. API keys embedded in an allowed settings file, such as an MCP
+server's `env` block in `settings.json`, remain part of that file and are backed
+up. Use [Path Exclusions](#path-exclusions) to exclude additional files or
+directories. To deliberately include the default credential filenames, set
+`ASB_INCLUDE_CREDENTIALS=true`; explicitly configured exclusions still apply.
 
-Backups made by asb 0.3.6 or earlier may already hold these files. They stay in the backup as they were and are no longer updated; `asb backup` warns about them. `asb prune <agent>` removes them in a new commit, and the earlier commits keep them until `asb prune <agent> --reinit` resets that backup's history (see below).
+Backups made by asb 0.3.6 or earlier may already track these files. Normal backup
+leaves their existing committed versions unchanged and warns about them. It
+unstages changes to excluded files, including newly staged credentials, without
+removing their local copies. It does not rewrite existing commits. To remove
+previously tracked excluded files from the current backup, first inspect
+`asb --dry-run prune <agent>`, then run `asb prune <agent>` and confirm. Prune
+commits only the excluded deletions and leaves unrelated staged settings alone;
+it refuses to discard a locally modified excluded file. Earlier commits and
+exports can still contain the credentials. History is discarded only if you
+explicitly request `asb prune <agent> --reinit` (see below). Rotate or revoke a
+credential if a backup containing it has been exposed.
 
 **Q: My backup folder is huge. How do I shrink it?**
 A: Backups made before an exclusion existed still contain that data, and every earlier commit keeps its copies (re-committing a multi-GB database every night grows `.git` by gigabytes). `asb prune <agent> --dry-run` shows what the current policy excludes; `asb prune <agent>` removes it in a new commit, which stops it being carried forward. To actually free the space, `asb prune <agent> --reinit` also resets that backup's history to a single commit and garbage-collects. That drops every earlier commit and tag, so `asb export` first if you need them. Both steps ask for confirmation unless you pass `--force`.

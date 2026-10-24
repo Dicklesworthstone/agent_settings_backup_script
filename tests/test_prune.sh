@@ -44,7 +44,7 @@ commit_legacy_file() {
     local mirror="$1" rel="$2"
     mkdir -p "$(dirname "${mirror}/${rel}")"
     printf 'legacy %s\n' "$rel" > "${mirror}/${rel}"
-    git -C "$mirror" add -f -- "$rel" >/dev/null 2>&1
+    git -C "$mirror" --literal-pathspecs add -f -- "$rel" >/dev/null 2>&1
     git -C "$mirror" commit -q -m "legacy backup with ${rel}" >/dev/null 2>&1
 }
 
@@ -135,6 +135,80 @@ test_prune_removes_legacy_excluded_files() {
     # The next backup must not bring the pruned files back.
     run_asb backup codex
     assert_file_not_exists "${mirror}/thread_history_1.sqlite" || return 1
+}
+
+test_prune_preserves_unrelated_staged_changes() {
+    create_codex_fixture
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    local mirror="${ASB_BACKUP_ROOT}/.codex" original_settings staged_before head_before
+    commit_legacy_file "$mirror" "profiles/work/auth.json"
+    head_before=$(git -C "$mirror" rev-parse HEAD)
+    original_settings=$(git -C "$mirror" show HEAD:settings.json)
+    printf 'unrelated staged settings\n' > "${mirror}/settings.json"
+    printf 'unrelated staged addition\n' > "${mirror}/new-settings.txt"
+    git -C "$mirror" add -- settings.json new-settings.txt
+    git -C "$mirror" rm -q -- config.json
+    staged_before=$(git -C "$mirror" diff --cached --binary)
+
+    run_asb prune codex --force
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_equals "$staged_before" "$(git -C "$mirror" diff --cached --binary)" || return 1
+    assert_equals "$original_settings" "$(git -C "$mirror" show HEAD:settings.json)" || return 1
+    assert_equals "" "$(git -C "$mirror" ls-tree --name-only HEAD -- new-settings.txt)" || return 1
+    assert_equals "unrelated staged settings" "$(cat "${mirror}/settings.json")" || return 1
+    assert_equals "unrelated staged addition" "$(cat "${mirror}/new-settings.txt")" || return 1
+    assert_file_not_exists "${mirror}/profiles/work/auth.json" || return 1
+    assert_equals "$head_before" "$(git -C "$mirror" rev-parse HEAD^)" || return 1
+    assert_equals "profiles/work/auth.json" "$(git -C "$mirror" diff-tree --no-commit-id --name-only -r HEAD)" || return 1
+    assert_equals "legacy profiles/work/auth.json" "$(git -C "$mirror" show "${head_before}:profiles/work/auth.json")" || return 1
+}
+
+test_prune_refuses_to_discard_modified_excluded_file() {
+    create_codex_fixture
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    local mirror="${ASB_BACKUP_ROOT}/.codex" before
+    commit_legacy_file "$mirror" "auth.json"
+    before=$(git -C "$mirror" rev-parse HEAD)
+    printf 'locally changed synthetic token\n' > "${mirror}/auth.json"
+
+    run_asb prune codex --force
+    assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
+    assert_equals "$before" "$(git -C "$mirror" rev-parse HEAD)" || return 1
+    assert_equals "locally changed synthetic token" "$(cat "${mirror}/auth.json")" || return 1
+    assert_equals "auth.json" "$(git -C "$mirror" ls-files -- auth.json)" || return 1
+}
+
+test_prune_respects_literal_configured_paths() {
+    create_codex_fixture
+    run_asb backup codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    local mirror="${ASB_BACKUP_ROOT}/.codex" before
+    commit_legacy_file "$mirror" "private keys/token[1]?.txt"
+    commit_legacy_file "$mirror" "private keys/token1x.txt"
+    commit_legacy_file "$mirror" "profiles/team A/session.token"
+    commit_legacy_file "$mirror" "profiles/team AB/settings.json"
+    before=$(git -C "$mirror" rev-parse HEAD)
+    export ASB_EXCLUDE_PATHS='private keys/token[1]?.txt'
+    mkdir -p "${XDG_CONFIG_HOME}/asb"
+    printf '%s\n' 'ASB_AGENT_EXCLUDE_PATHS[codex]="profiles/team A"' > "${XDG_CONFIG_HOME}/asb/config"
+
+    run_asb --json --dry-run prune codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" '"excluded_paths":2' || return 1
+    assert_equals "$before" "$(git -C "$mirror" rev-parse HEAD)" || return 1
+    assert_file_exists "${mirror}/private keys/token[1]?.txt" || return 1
+    assert_file_exists "${mirror}/profiles/team A/session.token" || return 1
+
+    run_asb --force prune codex
+    assert_exit_code 0 "$ASB_LAST_STATUS" || return 1
+    assert_file_not_exists "${mirror}/private keys/token[1]?.txt" || return 1
+    assert_dir_not_exists "${mirror}/profiles/team A" || return 1
+    assert_equals "legacy private keys/token1x.txt" "$(cat "${mirror}/private keys/token1x.txt")" || return 1
+    assert_equals "legacy profiles/team AB/settings.json" "$(cat "${mirror}/profiles/team AB/settings.json")" || return 1
+    assert_equals "$before" "$(git -C "$mirror" rev-parse HEAD^)" || return 1
+    assert_equals "legacy private keys/token[1]?.txt" "$(git -C "$mirror" show "${before}:private keys/token[1]?.txt")" || return 1
 }
 
 test_prune_reinit_drops_history() {
@@ -284,7 +358,7 @@ test_cp_fallback_restore_does_not_follow_symlinks() {
     assert_contains "$(cat "${HOME}/.gemini/settings.json")" '"agent":"gemini"' || return 1
 }
 
-test_cp_fallback_restore_refuses_when_staging_fails() {
+test_restore_refuses_when_snapshot_extraction_fails() {
     create_mock_agent "gemini"
     add_antigravity_tree
     run_asb backup gemini
@@ -293,13 +367,12 @@ test_cp_fallback_restore_refuses_when_staging_fails() {
     printf 'live only\n' > "${HOME}/.gemini/antigravity-cli/conversations/new.db"
     local before
     before=$(cd "${HOME}/.gemini" && find . -type f -exec cksum {} + | sort)
-    # Every copy out of the backup fails, so the staging copy does too.
-    local real_cp
-    real_cp=$(command -v cp)
+    # Restore now stages an immutable filtered Git archive rather than copying
+    # the backup working tree. Fail extraction at that staging boundary and
+    # prove that no live settings or protected data have been changed.
     use_failing_rsync
-    printf '#!/bin/sh\ncase "$*" in *"%s/"*) exit 1 ;; esac\nexec "%s" "$@"\n' \
-        "$ASB_BACKUP_ROOT" "$real_cp" > "${TEST_ENV_ROOT}/fakebin/cp"
-    chmod +x "${TEST_ENV_ROOT}/fakebin/cp"
+    printf '#!/bin/sh\nexit 1\n' > "${TEST_ENV_ROOT}/fakebin/tar"
+    chmod +x "${TEST_ENV_ROOT}/fakebin/tar"
 
     run_asb restore gemini --force
     assert_exit_code 1 "$ASB_LAST_STATUS" || return 1
@@ -621,6 +694,9 @@ run_test "backup_excludes_antigravity_transcripts" test_backup_excludes_antigrav
 run_test "restore_keeps_live_antigravity_transcripts" test_restore_keeps_live_antigravity_transcripts
 run_test "prune_dry_run_changes_nothing" test_prune_dry_run_changes_nothing
 run_test "prune_removes_legacy_excluded_files" test_prune_removes_legacy_excluded_files
+run_test "prune_preserves_unrelated_staged_changes" test_prune_preserves_unrelated_staged_changes
+run_test "prune_refuses_to_discard_modified_excluded_file" test_prune_refuses_to_discard_modified_excluded_file
+run_test "prune_respects_literal_configured_paths" test_prune_respects_literal_configured_paths
 run_test "prune_reinit_drops_history" test_prune_reinit_drops_history
 run_test "prune_clean_backup_is_noop" test_prune_clean_backup_is_noop
 run_test "prune_requires_confirmation_without_tty" test_prune_requires_confirmation_without_tty
@@ -629,7 +705,7 @@ run_test "cp_fallback_restore_keeps_live_transcripts" test_cp_fallback_restore_k
 run_test "cp_fallback_restore_ignores_legacy_excluded_copies" test_cp_fallback_restore_ignores_legacy_excluded_copies
 run_test "cp_fallback_backup_does_not_follow_symlinks" test_cp_fallback_backup_does_not_follow_symlinks
 run_test "cp_fallback_restore_does_not_follow_symlinks" test_cp_fallback_restore_does_not_follow_symlinks
-run_test "cp_fallback_restore_refuses_when_staging_fails" test_cp_fallback_restore_refuses_when_staging_fails
+run_test "restore_refuses_when_snapshot_extraction_fails" test_restore_refuses_when_snapshot_extraction_fails
 run_test "diff_shows_same_named_dirs_outside_antigravity" test_diff_shows_same_named_dirs_outside_antigravity
 run_test "restore_preview_shows_same_named_dirs_outside_antigravity" test_restore_preview_shows_same_named_dirs_outside_antigravity
 run_test "prune_reinit_refuses_when_branch_moved" test_prune_reinit_refuses_when_branch_moved

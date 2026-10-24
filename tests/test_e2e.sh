@@ -626,7 +626,9 @@ test_large_file_workflow() {
     create_claude_fixture
     local large_file="${HOME}/.claude/large.bin"
     if command -v dd >/dev/null 2>&1; then
-        dd if=/dev/zero of="$large_file" bs=1m count=5 >/dev/null 2>&1
+        # A numeric block size works with both GNU and BSD dd. Refuse a broken
+        # fixture instead of silently testing a backup without the large file.
+        dd if=/dev/zero of="$large_file" bs=1048576 count=5 >/dev/null 2>&1 || return 1
     elif command -v python3 >/dev/null 2>&1; then
         LARGE_FILE="$large_file" python3 - <<'PY'
 import os

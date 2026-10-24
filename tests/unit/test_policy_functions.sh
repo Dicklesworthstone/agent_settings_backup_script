@@ -171,6 +171,94 @@ profiles/work/auth.json" "$(asb_list_skipped_credentials "$dir")" || return 1
     assert_equals "" "$(asb_list_skipped_credentials "$dir")" || return 1
 }
 
+test_path_policy_matches_nested_credentials_and_settings() {
+    asb_use_policy claude || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/.credentials.json" f || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/auth.json" f || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/auth.json/token" f || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/login.keychain-db" f || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/cache/blob" f || return 1
+    assert_function_succeeds asb_is_excluded_path "jobs/queued.json" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/work/settings.json" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/work/auth.json.example" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/work/.env.example" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/work/jobs/notes.json" f || return 1
+}
+
+test_configured_path_policy_is_literal_and_scoped() {
+    ASB_EXCLUDE_PATHS=$'private.token\nprivate vault/\nprofiles/work/token[1]?.json'
+    # shellcheck disable=SC2034 # The sourced asb_use_policy reads this array.
+    local -A ASB_AGENT_EXCLUDE_PATHS=(
+        [claude]='claude-only/token'
+        [work]='work-only/token'
+    )
+    asb_use_policy claude || return 1
+    assert_function_succeeds asb_is_excluded_path "private.token" f || return 1
+    assert_function_succeeds asb_is_excluded_path "private vault" d || return 1
+    assert_function_succeeds asb_is_excluded_path "private vault/nested/file" f || return 1
+    assert_function_succeeds asb_is_excluded_path "profiles/work/token[1]?.json" f || return 1
+    assert_function_succeeds asb_is_excluded_path "claude-only/token" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/personal/private.token" f || return 1
+    assert_function_fails asb_is_excluded_path "profiles/work/token1x.json" f || return 1
+    assert_function_fails asb_is_excluded_path "work-only/token" f || return 1
+
+    asb_use_policy work || return 1
+    assert_function_succeeds asb_is_excluded_path "work-only/token" f || return 1
+    assert_function_succeeds asb_is_excluded_path "private.token" f || return 1
+    assert_function_fails asb_is_excluded_path "claude-only/token" f || return 1
+    asb_use_policy codex || return 1
+    assert_function_fails asb_is_excluded_path "work-only/token" f || return 1
+}
+
+test_configured_pathspecs_select_exact_files_and_subtrees() {
+    local repo="${TEST_ENV_ROOT}/literal_pathspec_repo"
+    mkdir -p "$repo/private vault/nested" "$repo/profiles/work"
+    git -C "$repo" init -q
+    printf 'x\n' > "$repo/private vault/nested/token"
+    printf 'x\n' > "$repo/profiles/work/token[1]?.json"
+    printf 'settings\n' > "$repo/profiles/work/token1x.json"
+    printf 'settings\n' > "$repo/profiles/work/settings.json"
+    git -C "$repo" add -A
+    ASB_EXCLUDE_PATHS=$'private vault/\nprofiles/work/token[1]?.json'
+    asb_use_policy claude || return 1
+    asb_excluded_pathspecs
+
+    local got
+    got=$(git -C "$repo" ls-files -- "${ASB_PRUNE_PATHSPECS[@]}" | sort)
+    assert_equals 'private vault/nested/token
+profiles/work/token[1]?.json' "$got" || return 1
+}
+
+test_filtered_copy_skips_secret_fifo_and_preserves_links() {
+    local source_dir="${TEST_ENV_ROOT}/copy_source" dest="${TEST_ENV_ROOT}/copy_dest"
+    local outside="${TEST_ENV_ROOT}/outside"
+    mkdir -p "$source_dir/profiles/work" "$source_dir/empty" "$outside"
+    printf 'settings\n' > "$source_dir/profiles/work/settings.json"
+    printf 'outside\n' > "$outside/auth.json"
+    mkfifo "$source_dir/profiles/work/.credentials.json"
+    ln -s "$outside" "$source_dir/linked"
+    # shellcheck disable=SC2034 # The sourced asb_use_policy reads this setting.
+    ASB_EXCLUDE_PATHS='profiles/work/private.token'
+    mkfifo "$source_dir/profiles/work/private.token"
+    asb_use_policy claude || return 1
+
+    asb_copy_filtered "$source_dir" "$dest" || return 1
+    assert_equals 'settings' "$(cat "$dest/profiles/work/settings.json")" || return 1
+    [[ ! -e "$dest/profiles/work/.credentials.json" ]] || return 1
+    [[ ! -e "$dest/profiles/work/private.token" ]] || return 1
+    [[ -L "$dest/linked" ]] || return 1
+    assert_equals "$outside" "$(readlink "$dest/linked")" || return 1
+    assert_dir_exists "$dest/empty" || return 1
+}
+
+test_filtered_copy_rejects_allowed_special_files() {
+    local source_dir="${TEST_ENV_ROOT}/special_source" dest="${TEST_ENV_ROOT}/special_dest"
+    mkdir -p "$source_dir"
+    mkfifo "$source_dir/settings.pipe"
+    asb_use_policy claude || return 1
+    assert_function_fails asb_copy_filtered "$source_dir" "$dest" || return 1
+}
+
 run_unit_test "excluded_name_matches_dirs_and_globs" test_excluded_name_matches_dirs_and_globs
 run_unit_test "excluded_name_matches_credentials" test_excluded_name_matches_credentials
 run_unit_test "include_credentials_opts_out_of_credential_rules_only" test_include_credentials_opts_out_of_credential_rules_only
@@ -184,3 +272,8 @@ run_unit_test "pathspecs_select_excluded_tracked_files" test_pathspecs_select_ex
 run_unit_test "strip_excluded_matches_rsync_policy" test_strip_excluded_matches_rsync_policy
 run_unit_test "strip_excluded_does_not_follow_symlinks" test_strip_excluded_does_not_follow_symlinks
 run_unit_test "filter_nested_diff_is_anchored" test_filter_nested_diff_is_anchored
+run_unit_test "path_policy_matches_nested_credentials_and_settings" test_path_policy_matches_nested_credentials_and_settings
+run_unit_test "configured_path_policy_is_literal_and_scoped" test_configured_path_policy_is_literal_and_scoped
+run_unit_test "configured_pathspecs_select_exact_files_and_subtrees" test_configured_pathspecs_select_exact_files_and_subtrees
+run_unit_test "filtered_copy_skips_secret_fifo_and_preserves_links" test_filtered_copy_skips_secret_fifo_and_preserves_links
+run_unit_test "filtered_copy_rejects_allowed_special_files" test_filtered_copy_rejects_allowed_special_files

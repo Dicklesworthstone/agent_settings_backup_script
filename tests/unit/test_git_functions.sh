@@ -161,6 +161,125 @@ test_create_backup_commit_special_chars_in_filename() {
     fi
 }
 
+test_create_backup_commit_reports_staging_failure() {
+    local test_dir="${TEST_ENV_ROOT}/stage_failure" before
+    mkdir -p "$test_dir"
+    init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    before=$(git -C "$test_dir" rev-parse HEAD)
+    printf 'new settings\n' > "${test_dir}/settings.json"
+    LAST_BACKUP_COMMIT="stale-result"
+
+    # A failed index update must not be reported as a successful backup.
+    git() {
+        local arg
+        for arg in "$@"; do
+            [[ "$arg" == "add" ]] && return 1
+        done
+        command git "$@"
+    }
+    assert_function_fails create_backup_commit "$test_dir" "testagent" || return 1
+    assert_equals "" "$LAST_BACKUP_COMMIT" || return 1
+    assert_equals "$before" "$(git -C "$test_dir" rev-parse HEAD)" || return 1
+    assert_equals "new settings" "$(cat "${test_dir}/settings.json")" || return 1
+}
+
+test_create_backup_commit_reports_commit_failure() {
+    local test_dir="${TEST_ENV_ROOT}/commit_failure" before
+    mkdir -p "$test_dir"
+    init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    before=$(git -C "$test_dir" rev-parse HEAD)
+    printf 'new settings\n' > "${test_dir}/settings.json"
+    printf '#!/bin/sh\nexit 1\n' > "${test_dir}/.git/hooks/pre-commit"
+    chmod +x "${test_dir}/.git/hooks/pre-commit"
+    LAST_BACKUP_COMMIT="stale-result"
+
+    assert_function_fails create_backup_commit "$test_dir" "testagent" || return 1
+    assert_equals "" "$LAST_BACKUP_COMMIT" || return 1
+    assert_equals "$before" "$(git -C "$test_dir" rev-parse HEAD)" || return 1
+    assert_equals "new settings" "$(git -C "$test_dir" show :settings.json)" || return 1
+}
+
+test_create_backup_commit_does_not_stage_replacement_directory_recursively() {
+    local test_dir="${TEST_ENV_ROOT}/file_to_directory" secret_oid
+    mkdir -p "$test_dir"
+    init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    printf 'old settings file\n' > "${test_dir}/profile"
+    create_backup_commit "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    mv "${test_dir}/profile" "${TEST_ENV_ROOT}/previous-profile"
+    mkdir -p "${test_dir}/profile"
+    printf 'synthetic nested token\n' > "${test_dir}/profile/auth.json"
+    printf 'allowed profile settings\n' > "${test_dir}/profile/settings.json"
+    secret_oid=$(printf 'synthetic nested token\n' | git hash-object --stdin)
+
+    create_backup_commit "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    assert_equals "allowed profile settings" "$(git -C "$test_dir" show HEAD:profile/settings.json)" || return 1
+    assert_equals "" "$(git -C "$test_dir" ls-files -- profile/auth.json)" || return 1
+    assert_equals "synthetic nested token" "$(cat "${test_dir}/profile/auth.json")" || return 1
+    if git -C "$test_dir" cat-file -e "$secret_oid" 2>/dev/null; then
+        echo "Excluded file contents were written into Git objects" >&2
+        return 1
+    fi
+}
+
+test_create_backup_commit_handles_directory_replaced_by_symlink() {
+    local test_dir="${TEST_ENV_ROOT}/directory_to_link" outside="${TEST_ENV_ROOT}/external-profile"
+    mkdir -p "${test_dir}/profile" "$outside"
+    printf 'old settings\n' > "${test_dir}/profile/settings.json"
+    init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    mv "${test_dir}/profile" "${TEST_ENV_ROOT}/previous-directory"
+    printf 'external synthetic token\n' > "${outside}/auth.json"
+    ln -s "$outside" "${test_dir}/profile"
+
+    create_backup_commit "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    assert_equals "$outside" "$(git -C "$test_dir" show HEAD:profile)" || return 1
+    assert_equals "profile" "$(git -C "$test_dir" ls-files -- profile)" || return 1
+    assert_equals "external synthetic token" "$(cat "${outside}/auth.json")" || return 1
+}
+
+test_create_backup_commit_keeps_excluded_staged_deletion_at_head() {
+    local test_dir="${TEST_ENV_ROOT}/excluded_deletion" before
+    mkdir -p "$test_dir"
+    init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    printf 'legacy synthetic token\n' > "${test_dir}/auth.json"
+    git -C "$test_dir" add -f -- auth.json
+    git -C "$test_dir" commit -qm 'Synthetic legacy credential'
+    before=$(git -C "$test_dir" rev-parse HEAD)
+    git -C "$test_dir" rm -q --cached -- auth.json
+    printf 'allowed settings change\n' > "${test_dir}/settings.json"
+
+    create_backup_commit "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+    assert_equals "$before" "$(git -C "$test_dir" rev-parse HEAD^)" || return 1
+    assert_equals "legacy synthetic token" "$(git -C "$test_dir" show HEAD:auth.json)" || return 1
+    assert_equals "legacy synthetic token" "$(cat "${test_dir}/auth.json")" || return 1
+    assert_equals "allowed settings change" "$(git -C "$test_dir" show HEAD:settings.json)" || return 1
+}
+
+test_create_backup_commit_refuses_legacy_nested_repositories() {
+    local tracked test_dir head_before index_before
+    for tracked in true false; do
+        test_dir="${TEST_ENV_ROOT}/nested_repository_${tracked}"
+        mkdir -p "$test_dir"
+        init_git_repo "$test_dir" "testagent" >/dev/null 2>&1 || return 1
+        mkdir -p "${test_dir}/nested"
+        git -C "${test_dir}/nested" init -q
+        printf 'nested settings\n' > "${test_dir}/nested/settings.json"
+        git -C "${test_dir}/nested" add -- settings.json
+        git -C "${test_dir}/nested" commit -qm 'Nested settings fixture'
+        if [[ "$tracked" == true ]]; then
+            git -C "$test_dir" add -- nested >/dev/null 2>&1
+            git -C "$test_dir" commit -qm 'Legacy nested repository fixture'
+        fi
+        head_before=$(git -C "$test_dir" rev-parse HEAD)
+        index_before=$(git -C "$test_dir" write-tree)
+        printf 'unrelated settings\n' > "${test_dir}/settings.json"
+
+        assert_function_fails create_backup_commit "$test_dir" "testagent" || return 1
+        assert_equals "$head_before" "$(git -C "$test_dir" rev-parse HEAD)" || return 1
+        assert_equals "$index_before" "$(git -C "$test_dir" write-tree)" || return 1
+        assert_equals "nested settings" "$(cat "${test_dir}/nested/settings.json")" || return 1
+    done
+}
+
 # ============================================
 # resolve_tag_or_commit tests
 # Note: This function takes (agent_name, ref) not (dir, ref)
@@ -258,6 +377,12 @@ run_unit_test "create_backup_commit_message_format" test_create_backup_commit_me
 run_unit_test "create_backup_commit_no_changes" test_create_backup_commit_no_changes
 run_unit_test "create_backup_commit_sets_last_commit_var" test_create_backup_commit_sets_last_commit_var
 run_unit_test "create_backup_commit_special_chars_in_filename" test_create_backup_commit_special_chars_in_filename
+run_unit_test "create_backup_commit_reports_staging_failure" test_create_backup_commit_reports_staging_failure
+run_unit_test "create_backup_commit_reports_commit_failure" test_create_backup_commit_reports_commit_failure
+run_unit_test "create_backup_commit_does_not_stage_replacement_directory_recursively" test_create_backup_commit_does_not_stage_replacement_directory_recursively
+run_unit_test "create_backup_commit_handles_directory_replaced_by_symlink" test_create_backup_commit_handles_directory_replaced_by_symlink
+run_unit_test "create_backup_commit_keeps_excluded_staged_deletion_at_head" test_create_backup_commit_keeps_excluded_staged_deletion_at_head
+run_unit_test "create_backup_commit_refuses_legacy_nested_repositories" test_create_backup_commit_refuses_legacy_nested_repositories
 run_unit_test "resolve_tag_existing_tag" test_resolve_tag_existing_tag
 run_unit_test "resolve_tag_short_commit_hash" test_resolve_tag_short_commit_hash
 run_unit_test "resolve_tag_full_commit_hash" test_resolve_tag_full_commit_hash
