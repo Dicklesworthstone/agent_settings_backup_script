@@ -2,7 +2,9 @@
 #
 # Unit Tests: backup exclusion policy helpers
 # asb_is_excluded_name, asb_holds_nested_exclusion, asb_excluded_pathspecs,
-# asb_strip_excluded and the derived ASB_RSYNC_EXCLUDES / ASB_DIFF_EXCLUDES
+# asb_strip_excluded, the credential rules (asb_build_shared_policy,
+# asb_holds_credentials, asb_list_skipped_credentials) and the derived
+# ASB_RSYNC_EXCLUDES / ASB_DIFF_EXCLUDES
 #
 
 test_excluded_name_matches_dirs_and_globs() {
@@ -111,7 +113,69 @@ Only in ${b}/tools: brain
 Files ${a}/antigravity-cli/settings.json and ${b}/antigravity-cli/settings.json differ" "$got" || return 1
 }
 
+test_excluded_name_matches_credentials() {
+    assert_function_succeeds asb_is_excluded_name ".credentials.json" || return 1
+    assert_function_succeeds asb_is_excluded_name "auth.json" || return 1
+    assert_function_succeeds asb_is_excluded_name "oauth_creds.json" || return 1
+    assert_function_succeeds asb_is_excluded_name "mcp-oauth-tokens.json" || return 1
+    assert_function_succeeds asb_is_excluded_name ".env" || return 1
+    assert_function_succeeds asb_is_excluded_name "login.keychain-db" || return 1
+    assert_function_fails asb_is_excluded_name "auth.json.example" || return 1
+    assert_function_fails asb_is_excluded_name ".env.example" || return 1
+    assert_function_fails asb_is_excluded_name "credentials.md" || return 1
+    local joined=" ${ASB_RSYNC_EXCLUDES[*]} ${ASB_DIFF_EXCLUDES[*]} "
+    assert_contains "$joined" " --exclude=.credentials.json " || return 1
+    assert_contains "$joined" " --exclude=auth.json " || return 1
+}
+
+test_include_credentials_opts_out_of_credential_rules_only() {
+    ASB_INCLUDE_CREDENTIALS=true
+    asb_build_shared_policy
+    asb_use_policy
+    assert_function_fails asb_is_excluded_name ".credentials.json" || return 1
+    assert_function_fails asb_is_excluded_name "auth.json" || return 1
+    assert_function_succeeds asb_is_excluded_name "debug.log" || return 1
+    assert_function_succeeds asb_is_excluded_name "sessions" || return 1
+    local joined=" ${ASB_RSYNC_EXCLUDES[*]} "
+    assert_not_contains "$joined" " --exclude=auth.json " || return 1
+    assert_contains "$joined" " --exclude=*.log " || return 1
+}
+
+test_holds_credentials() {
+    local dir="${TEST_ENV_ROOT}/holds" outside="${TEST_ENV_ROOT}/holds_outside"
+    mkdir -p "$dir/profiles/work" "$dir/skills" "$outside"
+    printf 'x\n' > "$dir/profiles/work/.credentials.json"
+    printf 'x\n' > "$dir/skills/SKILL.md"
+    printf 'x\n' > "$outside/auth.json"
+    ln -s "$outside" "$dir/linked"
+    assert_function_succeeds asb_holds_credentials "$dir/profiles" || return 1
+    assert_function_fails asb_holds_credentials "$dir/skills" || return 1
+    assert_function_fails asb_holds_credentials "$dir/profiles/work/.credentials.json" || return 1
+    # Not followed: nothing behind a link is restored over or deleted.
+    assert_function_fails asb_holds_credentials "$dir/linked" || return 1
+    ASB_INCLUDE_CREDENTIALS=true
+    assert_function_fails asb_holds_credentials "$dir/profiles" || return 1
+}
+
+test_list_skipped_credentials_skips_excluded_data_dirs() {
+    local dir="${TEST_ENV_ROOT}/skipped"
+    mkdir -p "$dir/profiles/work" "$dir/sessions/a" "$dir/.git"
+    printf 'x\n' > "$dir/.credentials.json"
+    printf 'x\n' > "$dir/profiles/work/auth.json"
+    printf 'x\n' > "$dir/sessions/a/auth.json"
+    printf 'x\n' > "$dir/.git/auth.json"
+    printf 'x\n' > "$dir/settings.json"
+    assert_equals ".credentials.json
+profiles/work/auth.json" "$(asb_list_skipped_credentials "$dir")" || return 1
+    ASB_INCLUDE_CREDENTIALS=true
+    assert_equals "" "$(asb_list_skipped_credentials "$dir")" || return 1
+}
+
 run_unit_test "excluded_name_matches_dirs_and_globs" test_excluded_name_matches_dirs_and_globs
+run_unit_test "excluded_name_matches_credentials" test_excluded_name_matches_credentials
+run_unit_test "include_credentials_opts_out_of_credential_rules_only" test_include_credentials_opts_out_of_credential_rules_only
+run_unit_test "holds_credentials" test_holds_credentials
+run_unit_test "list_skipped_credentials_skips_excluded_data_dirs" test_list_skipped_credentials_skips_excluded_data_dirs
 run_unit_test "excluded_name_keeps_settings" test_excluded_name_keeps_settings
 run_unit_test "holds_nested_exclusion" test_holds_nested_exclusion
 run_unit_test "rsync_excludes_derived_from_policy" test_rsync_excludes_derived_from_policy

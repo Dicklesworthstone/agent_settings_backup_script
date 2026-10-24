@@ -32,6 +32,7 @@
 #   ASB_AUTO_COMMIT         Auto-commit on backup (default: true)
 #   ASB_VERBOSE             Verbose output (default: false)
 #   ASB_LOCK_WAIT           Seconds to wait for another asb writing the same backup (default: 300)
+#   ASB_INCLUDE_CREDENTIALS Back up login tokens and API key files too (default: false)
 #
 # Repository: https://github.com/Dicklesworthstone/agent_settings_backup_script
 # License: MIT
@@ -635,8 +636,8 @@ ASB_EXCLUDED_DIRS=(
     db-backups node_modules
 )
 
-# File-name globs excluded at any depth.
-ASB_EXCLUDED_FILE_GLOBS=(
+# Data file-name globs excluded at any depth.
+ASB_DATA_FILE_GLOBS=(
     '*.log'
     '*.sqlite3-wal' '*.sqlite3-shm'
     '*.sqlite-wal' '*.sqlite-shm'
@@ -644,6 +645,32 @@ ASB_EXCLUDED_FILE_GLOBS=(
     'thread_history_*.sqlite'
     'logs_*.sqlite'
     '*.log.[0-9]*' '*.log.gz'
+)
+
+# Credential files, excluded at any depth unless ASB_INCLUDE_CREDENTIALS=true.
+# A backup is a git history that is easy to copy, export and push, and a
+# login token in it stays in every later clone. Restore applies the same rule:
+# it never deletes or overwrites a live credential file, and it does not bring
+# back one that an older backup holds (a saved OAuth refresh token has usually
+# been rotated since). API keys typed into a settings file (an MCP server's
+# env block) are part of that file and still backed up.
+#   .credentials.json                     Claude Code's OAuth tokens (Linux, WSL)
+#   auth.json                             Codex CLI's login tokens and API key
+#   oauth_creds.json                      Gemini CLI and Qwen Code OAuth tokens
+#   oauth_credentials.json                the same, under an older name
+#   mcp-oauth-tokens.json                 Gemini CLI's tokens for MCP servers
+#   application_default_credentials.json  Google Cloud credentials
+#   .env                                  API keys (~/.gemini/.env, ~/.qwen/.env)
+#   *.keychain *.keychain-db              keychain files
+ASB_CREDENTIAL_FILE_GLOBS=(
+    '.credentials.json'
+    'auth.json'
+    'oauth_creds.json'
+    'oauth_credentials.json'
+    'mcp-oauth-tokens.json'
+    'application_default_credentials.json'
+    '.env'
+    '*.keychain' '*.keychain-db'
 )
 
 # Directories excluded only at this path relative to the agent's root, for
@@ -669,18 +696,33 @@ declare -A ASB_AGENT_EXCLUDED_NESTED=(
     [codex]="computer-use"
 )
 
-ASB_RSYNC_EXCLUDES_BASE=(--exclude='.git' --exclude='.gitignore')
-# `diff -rq` matches base names only (no trailing slashes).
-ASB_DIFF_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
-for _asb_x in "${ASB_EXCLUDED_DIRS[@]}"; do
-    ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${_asb_x}/")
-    ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
-done
-for _asb_x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
-    ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${_asb_x}")
-    ASB_DIFF_EXCLUDES+=("--exclude=${_asb_x}")
-done
-unset _asb_x
+asb_includes_credentials() {
+    is_truthy "${ASB_INCLUDE_CREDENTIALS:-false}"
+}
+
+# Build the rules shared by every agent: ASB_EXCLUDED_FILE_GLOBS (the data
+# globs, plus the credential globs unless ASB_INCLUDE_CREDENTIALS is true),
+# ASB_RSYNC_EXCLUDES_BASE and ASB_DIFF_EXCLUDES. Runs at load and again after
+# the config file is read, since the config may set ASB_INCLUDE_CREDENTIALS.
+asb_build_shared_policy() {
+    local x
+    ASB_EXCLUDED_FILE_GLOBS=("${ASB_DATA_FILE_GLOBS[@]}")
+    if ! asb_includes_credentials; then
+        ASB_EXCLUDED_FILE_GLOBS+=("${ASB_CREDENTIAL_FILE_GLOBS[@]}")
+    fi
+    ASB_RSYNC_EXCLUDES_BASE=(--exclude='.git' --exclude='.gitignore')
+    # `diff -rq` matches base names only (no trailing slashes).
+    ASB_DIFF_EXCLUDES=(--exclude='.git' --exclude='.gitignore')
+    for x in "${ASB_EXCLUDED_DIRS[@]}"; do
+        ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${x}/")
+        ASB_DIFF_EXCLUDES+=("--exclude=${x}")
+    done
+    for x in "${ASB_EXCLUDED_FILE_GLOBS[@]}"; do
+        ASB_RSYNC_EXCLUDES_BASE+=("--exclude=${x}")
+        ASB_DIFF_EXCLUDES+=("--exclude=${x}")
+    done
+}
+asb_build_shared_policy
 
 # Select the policy for one agent: ASB_EXCLUDED_NESTED (the root-relative
 # exclusions in force) and ASB_RSYNC_EXCLUDES. Every per-agent operation
@@ -752,6 +794,90 @@ asb_holds_nested_exclusion() {
         [[ "$nested" == */* && "${nested%%/*}" == "$name" ]] && return 0
     done
     return 1
+}
+
+# find(1) arguments matching the credential file names, into
+# ASB_CREDENTIAL_FIND_ARGS: ( -name A -o -name B ... )
+asb_credential_find_args() {
+    local x
+    local -a names=()
+    for x in "${ASB_CREDENTIAL_FILE_GLOBS[@]}"; do
+        names+=(-o -name "$x")
+    done
+    ASB_CREDENTIAL_FIND_ARGS=(\( "${names[@]:1}" \))
+}
+
+# True if a directory (not a symlink to one) holds a credential file that the
+# policy excludes. The restore cp fallback merges the backup over such an
+# entry instead of replacing it, so live credentials below the top level
+# survive, as they do under rsync.
+asb_holds_credentials() {
+    local path="$1"
+    asb_includes_credentials && return 1
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    asb_credential_find_args
+    [[ -n "$(find "$path" ! -type d "${ASB_CREDENTIAL_FIND_ARGS[@]}" -print -quit 2>/dev/null)" ]]
+}
+
+# Print the credential files in a live agent folder that the backup leaves
+# out, relative to that folder (names only; no file is read). Data dirs the
+# backup excludes anyway are not searched.
+asb_list_skipped_credentials() {
+    local dir="$1" x
+    local -a prune_args=(-name .git)
+    asb_includes_credentials && return 0
+    [[ -d "$dir" ]] || return 0
+    for x in "${ASB_EXCLUDED_DIRS[@]}"; do
+        prune_args+=(-o -name "$x")
+    done
+    asb_credential_find_args
+    (cd "$dir" 2>/dev/null && find . -mindepth 1 \( -type d \( "${prune_args[@]}" \) \) -prune \
+        -o ! -type d "${ASB_CREDENTIAL_FIND_ARGS[@]}" -print 2>/dev/null) \
+        | sed 's|^\./||' | sort
+}
+
+# Print the credential files a backup repository still tracks because an
+# earlier asb copied them. They are no longer updated; `asb prune` removes them.
+asb_list_tracked_credentials() {
+    local dest="$1" x
+    local -a specs=()
+    asb_includes_credentials && return 0
+    [[ -d "$dest/.git" ]] || return 0
+    for x in "${ASB_CREDENTIAL_FILE_GLOBS[@]}"; do
+        specs+=(":(glob)**/${x}")
+    done
+    git -C "$dest" ls-files -- "${specs[@]}" 2>/dev/null
+}
+
+# Tell the user which credential files a backup leaves out (dry run only)
+# and which ones the backup still tracks from an earlier asb. Paths only.
+asb_report_credentials() {
+    local agent="$1" source="$2" dest="$3"
+    local agent_name="${AGENT_NAMES[$agent]:-$agent}"
+    local -a left_out=() tracked=()
+    local line
+    asb_includes_credentials && return 0
+    is_json_output && return 0
+    if [[ "$DRY_RUN" == "true" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && left_out+=("$line")
+        done < <(asb_list_skipped_credentials "$source")
+        if (( ${#left_out[@]} > 0 )); then
+            log_info "${DIM}[DRY RUN]${RESET} Credential files left out of the backup (ASB_INCLUDE_CREDENTIALS=true includes them):"
+            for line in "${left_out[@]:0:10}"; do
+                printf '  %s\n' "$line" >&2
+            done
+            (( ${#left_out[@]} > 10 )) && printf '  ... and %d more\n' $(( ${#left_out[@]} - 10 )) >&2
+        fi
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && tracked+=("$line")
+    done < <(asb_list_tracked_credentials "$dest")
+    if (( ${#tracked[@]} > 0 )); then
+        log_warn "${agent_name}: the backup still holds ${#tracked[@]} credential file(s) that an earlier asb copied; they are no longer updated: ${tracked[*]:0:5}"
+        log_info "  'asb prune ${agent}' removes them in a new commit; earlier commits keep them until 'asb prune --reinit ${agent}'"
+    fi
+    return 0
 }
 
 # Git pathspecs matching every path the policy excludes, into ASB_PRUNE_PATHSPECS.
@@ -843,6 +969,7 @@ backup_agent() {
                     log_info "${DIM}[DRY RUN]${RESET} Destination does not exist; all files would be copied"
                 fi
             fi
+            asb_report_credentials "$agent" "$source" "$dest"
 
             if is_truthy "${ASB_AUTO_COMMIT:-true}"; then
                 if [[ -d "$dest/.git" ]]; then
@@ -934,6 +1061,7 @@ backup_agent() {
     fi
 
     run_hooks "post-backup" "$agent" "$hook_commit" || true
+    asb_report_credentials "$agent" "$source" "$dest"
 
     # Build JSON result
     local json_result
@@ -1407,9 +1535,11 @@ restore_agent() {
             [[ -e "$_entry" || -L "$_entry" ]] || continue
             _name="$(basename "$_entry")"
             asb_is_excluded_name "$_name" && continue
-            # Holds live data the backup excludes (antigravity-cli/conversations):
-            # merge over it below instead of deleting it.
+            # Holds live data the backup excludes (antigravity-cli/conversations,
+            # a profile's credential file): merge over it below instead of
+            # deleting it.
             asb_holds_nested_exclusion "$_name" && continue
+            asb_holds_credentials "$_entry" && continue
             rm -rf "$_entry" 2>/dev/null
         done
         cp -r "$_stage"/. "$dest/" 2>/dev/null || true
@@ -3630,6 +3760,18 @@ init_config() {
 # ASB_VERBOSE=false
 
 #-----------------------------------------------------------------------------
+# CREDENTIAL FILES
+#-----------------------------------------------------------------------------
+# Login tokens and API key files are left out of backups: .credentials.json,
+# auth.json, oauth_creds.json, oauth_credentials.json, mcp-oauth-tokens.json,
+# application_default_credentials.json, .env, *.keychain and *.keychain-db,
+# at any depth. Restore never deletes or overwrites the live copies.
+# Set to "true" to back them up and restore them as well.
+# Default: false
+#
+# ASB_INCLUDE_CREDENTIALS=false
+
+#-----------------------------------------------------------------------------
 # FUTURE OPTIONS (not yet implemented)
 #-----------------------------------------------------------------------------
 # Custom exclusion patterns, agent definitions, etc. will go here
@@ -3664,6 +3806,7 @@ show_config() {
     printf "%-20s %s\n" "ASB_BACKUP_ROOT:" "$(get_backup_root)" >&2
     printf "%-20s %s\n" "ASB_AUTO_COMMIT:" "${ASB_AUTO_COMMIT:-true}" >&2
     printf "%-20s %s\n" "ASB_VERBOSE:" "${ASB_VERBOSE:-false}" >&2
+    printf "%-20s %s\n" "ASB_INCLUDE_CREDENTIALS:" "${ASB_INCLUDE_CREDENTIALS:-false}" >&2
     printf '\n' >&2
 
     # Show source of each value (helpful for debugging)
@@ -4201,6 +4344,9 @@ ${BOLD}ENVIRONMENT${RESET}
     ASB_AUTO_COMMIT       Auto-commit on backup (default: true)
     ASB_VERBOSE           Verbose output (default: false)
     ASB_LOCK_WAIT         Seconds to wait for another asb writing the same backup (default: 300)
+    ASB_INCLUDE_CREDENTIALS
+                          Back up login tokens and API key files (.credentials.json,
+                          auth.json, oauth_creds.json, .env, ...) too (default: false)
 
     Tip: Use 'asb config init' to create a persistent config file.
 
@@ -4484,6 +4630,9 @@ main() {
     if ! load_config; then
         exit 1
     fi
+    # The config may set ASB_INCLUDE_CREDENTIALS.
+    asb_build_shared_policy
+    asb_use_policy
 
     # Load custom agents from config
     load_custom_agents

@@ -339,6 +339,7 @@ Environment variables:
 | `ASB_AUTO_COMMIT` | `true` | Auto-commit on backup |
 | `ASB_VERBOSE` | `false` | Verbose output |
 | `ASB_LOCK_WAIT` | `300` | Seconds a backup, restore, import, tag or prune waits while another asb writes the same agent's backup |
+| `ASB_INCLUDE_CREDENTIALS` | `false` | Back up and restore login tokens and API key files too (see [FAQ](#faq)) |
 
 ## Hooks
 
@@ -598,6 +599,11 @@ A: Use `asb export <agent> backup.tar.gz` on the source machine, copy the file, 
 
 **Q: What files are excluded from backups?**
 A: asb backs up settings, not session data. Excluded everywhere: logs (`*.log`, rotated `*.log.1`… and `*.log.gz`), caches (`cache/`, `Cache/`, `.cache/`), session transcripts and edit history (`sessions/`, `archived_sessions/`, `file-history/`, `projects/`, `downloads/`, `shell-snapshots/`), SQLite write-ahead sidecars (`*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite3-wal`, `*.sqlite3-shm`, `*.db-wal`, `*.db-shm`), Codex's session databases (`thread_history_*.sqlite`, `logs_*.sqlite`, `db-backups/`), and `node_modules/` (installed npm packages; `package.json` is kept). Excluded only at the top of an agent's folder: `tmp/` (Gemini CLI keeps per-project chats and logs there), Antigravity's `antigravity-cli/conversations/` and `antigravity-cli/brain/` under `~/.gemini`, and the server binaries Codex downloads for itself (`packages/app-server-daemon/`, `plugins/.plugin-appserver/`). Per agent: OpenCode's and Factory's `bin/` (their own installed binaries), Claude Code's `jobs/` (background-job state and scratch), and Codex's `computer-use/` (the macOS app it downloads). A `bin/` you keep in `~/.claude` is still backed up. Restore never deletes any of these from the live folder.
+
+**Q: Are my login tokens and API keys backed up?**
+A: No, not by default. These files are left out at any depth, for built-in and custom agents alike: `.credentials.json` (Claude Code on Linux and WSL), `auth.json` (Codex CLI), `oauth_creds.json` and `oauth_credentials.json` (Gemini CLI, Qwen Code), `mcp-oauth-tokens.json` (Gemini CLI's MCP logins), `application_default_credentials.json` (Google Cloud), `.env`, `*.keychain` and `*.keychain-db`. The rule covers rsync and the `cp` fallback alike, and `asb backup --dry-run` lists the files it leaves out (names only). Restore never deletes or overwrites a live credential file, and it does not bring back one that an older backup holds, because a saved OAuth token has usually been rotated by then. API keys written into a settings file (an MCP server's `env` block in `settings.json`, say) are part of that file and are still backed up. To back up and restore credential files as well, set `ASB_INCLUDE_CREDENTIALS=true` in the environment or the config file.
+
+Backups made by asb 0.3.6 or earlier may already hold these files. They stay in the backup as they were and are no longer updated; `asb backup` warns about them. `asb prune <agent>` removes them in a new commit, and the earlier commits keep them until `asb prune <agent> --reinit` resets that backup's history (see below).
 
 **Q: My backup folder is huge. How do I shrink it?**
 A: Backups made before an exclusion existed still contain that data, and every earlier commit keeps its copies (re-committing a multi-GB database every night grows `.git` by gigabytes). `asb prune <agent> --dry-run` shows what the current policy excludes; `asb prune <agent>` removes it in a new commit, which stops it being carried forward. To actually free the space, `asb prune <agent> --reinit` also resets that backup's history to a single commit and garbage-collects. That drops every earlier commit and tag, so `asb export` first if you need them. Both steps ask for confirmation unless you pass `--force`.
