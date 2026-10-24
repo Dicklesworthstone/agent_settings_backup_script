@@ -6,11 +6,16 @@ Versions follow [Semantic Versioning](https://semver.org/). v0.2.0 has an annota
 
 ---
 
-## [Unreleased]
+## [v0.3.7] — 2026-10-24
 
 ### Changed
 
 - **Login tokens and API key files are no longer backed up** ([#5](https://github.com/Dicklesworthstone/agent_settings_backup_script/issues/5)). A backup is a git history that is easy to copy, export and push, and asb was copying `~/.claude/.credentials.json`, `~/.codex/auth.json` and similar files into it. Now left out at any depth, for built-in and custom agents, with rsync and with the `cp` fallback: `.credentials.json`, `auth.json`, `oauth_creds.json`, `oauth_credentials.json`, `mcp-oauth-tokens.json`, `application_default_credentials.json`, `.env`, `*.keychain` and `*.keychain-db`. `asb backup --dry-run` lists the files it leaves out (names only). Restore never deletes or overwrites a live credential file, and no longer brings back one that an older backup holds; it names the ones it leaves out. Set `ASB_INCLUDE_CREDENTIALS=true` (environment or config file) to back them up and restore them as before. Copies already in a backup stay there, are no longer updated, and `asb backup` now warns about them; `asb prune` removes them in a new commit, and `asb prune --reinit` also drops them from history.
+- asb now needs Git 2.26 or later. Staging and pruning pass exact, NUL-delimited path lists to `git add`, `git reset` and `git rm` (`--pathspec-from-file`), which older Git lacks.
+
+### Added
+
+- **Your own path exclusions.** `ASB_EXCLUDE_PATHS` (every agent) and `ASB_AGENT_EXCLUDE_PATHS[<agent>]` (one built-in or custom agent) list extra files or directories to leave out, one per line, relative to the agent's folder. Paths are literal (no wildcards), a directory excludes its whole subtree, and they apply to backup, `diff`, staging, `prune` and restore like the built-in exclusions. `ASB_INCLUDE_CREDENTIALS=true` does not override them. See [Path Exclusions](README.md#path-exclusions).
 
 ---
 
