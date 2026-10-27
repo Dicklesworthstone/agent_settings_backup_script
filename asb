@@ -615,30 +615,49 @@ asb_stage_allowed_changes() (
         fi
     done < "$work/candidates"
 
+    # Keep git's stderr for these index updates: a stale index.lock, an
+    # unreadable file and a damaged index all fail the same way otherwise.
     if [[ -s "$work/excluded" ]]; then
         if [[ "$has_head" == true ]]; then
             if ! git -C "$dir" --literal-pathspecs reset -q --no-refresh HEAD \
-                --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>&1; then
+                --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>"$work/git.err"; then
                 log_error "Could not protect excluded paths in the backup index"
+                asb_log_git_stderr < "$work/git.err"
                 return 1
             fi
         elif ! git -C "$dir" --literal-pathspecs rm -q -r -f --cached --ignore-unmatch \
-            --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>&1; then
+            --pathspec-from-file="$work/excluded" --pathspec-file-nul >/dev/null 2>"$work/git.err"; then
             log_error "Could not remove excluded paths from the initial backup index"
+            asb_log_git_stderr < "$work/git.err"
             return 1
         fi
     fi
-    if [[ -s "$work/remove" ]] && ! git -C "$dir" update-index --force-remove -z --stdin < "$work/remove" >/dev/null 2>&1; then
+    if [[ -s "$work/remove" ]] && ! git -C "$dir" update-index --force-remove -z --stdin < "$work/remove" >/dev/null 2>"$work/git.err"; then
         log_error "Could not stage removed backup settings"
+        asb_log_git_stderr < "$work/git.err"
         return 1
     fi
     if [[ -s "$work/add" ]] && ! git -C "$dir" --literal-pathspecs add -A \
-        --pathspec-from-file="$work/add" --pathspec-file-nul >/dev/null 2>&1; then
+        --pathspec-from-file="$work/add" --pathspec-file-nul >/dev/null 2>"$work/git.err"; then
         log_error "Could not stage allowed backup files"
+        asb_log_git_stderr < "$work/git.err"
         return 1
     fi
     return 0
 )
+
+# Show the first few lines a failed git command wrote to stderr (on stdin),
+# beneath the error that names the step. Git names paths, locks and missing
+# identity there, never file contents.
+asb_log_git_stderr() {
+    local line shown=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        log_error "  git: ${line}"
+        shown=$((shown + 1))
+        (( shown < 5 )) || break
+    done
+}
 
 init_git_repo() {
     local dir="$1"
@@ -690,8 +709,10 @@ EOF
 
         # Initial commit
         asb_stage_allowed_changes "$dir" "$agent" || return 1
-        if ! git -C "$dir" commit -m "Initial backup of ${agent_name} settings" --allow-empty >/dev/null 2>&1; then
+        local commit_err
+        if ! commit_err=$(git -C "$dir" commit -m "Initial backup of ${agent_name} settings" --allow-empty 2>&1 >/dev/null); then
             log_error "Could not create initial backup commit for ${agent_name}"
+            asb_log_git_stderr <<< "$commit_err"
             return 1
         fi
         log_success "Git repository initialized"
@@ -734,8 +755,10 @@ create_backup_commit() {
     fi
 
     # Commit
-    if ! git -C "$dir" commit -m "$message" >/dev/null 2>&1; then
+    local commit_err
+    if ! commit_err=$(git -C "$dir" commit -m "$message" 2>&1 >/dev/null); then
         log_error "Could not create backup commit for ${agent_name}"
+        asb_log_git_stderr <<< "$commit_err"
         return 1
     fi
     log_success "Created backup commit for ${agent_name}"

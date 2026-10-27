@@ -241,6 +241,10 @@ test_backup_from_cron_environment() {
         return 2
     fi
     create_claude_fixture
+    # Cron keeps HOME, so a real user's ~/.gitconfig identity survives env -i.
+    # Without one, git's identity guess depends on this host's name.
+    git config --file "$HOME/.gitconfig" user.name "ASB Test"
+    git config --file "$HOME/.gitconfig" user.email "asb-test@example.com"
     local out status=0
     out=$(env -i HOME="$HOME" ASB_BACKUP_ROOT="$ASB_BACKUP_ROOT" XDG_STATE_HOME="$XDG_STATE_HOME" \
         PATH=/usr/bin:/bin /bin/bash "${REPO_ROOT}/asb" backup claude 2>&1) || status=$?

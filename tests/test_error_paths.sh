@@ -29,6 +29,23 @@ test_backup_unknown_agent() {
     return 1
 }
 
+test_backup_staging_failure_shows_git_error() {
+    create_claude_fixture
+    run_asb backup claude || { echo "Initial backup failed: $ASB_LAST_OUTPUT" >&2; return 1; }
+
+    # A stale lock left by an interrupted git process makes every index
+    # update fail; the error must say so instead of only naming the step.
+    printf '{"agent":"claude","setting":false}\n' > "${HOME}/.claude/settings.json"
+    : > "${ASB_BACKUP_ROOT}/.claude/.git/index.lock"
+    run_asb backup claude
+    if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
+        echo "Expected failure with a stale index.lock" >&2
+        return 1
+    fi
+    assert_contains "$ASB_LAST_OUTPUT" "Could not stage" || return 1
+    assert_contains "$ASB_LAST_OUTPUT" "index.lock" || return 1
+}
+
 test_backup_invalid_agent_name() {
     run_asb backup "agent with spaces"
     if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
@@ -302,6 +319,7 @@ test_missing_required_args() {
 
 # Run all tests
 run_test "backup_unknown_agent" test_backup_unknown_agent || true
+run_test "backup_staging_failure_shows_git_error" test_backup_staging_failure_shows_git_error || true
 run_test "backup_invalid_agent_name" test_backup_invalid_agent_name || true
 run_test "restore_unknown_agent" test_restore_unknown_agent || true
 run_test "restore_no_backup_exists" test_restore_no_backup_exists || true
