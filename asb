@@ -646,17 +646,28 @@ asb_stage_allowed_changes() (
     return 0
 )
 
-# Show the first few lines a failed git command wrote to stderr (on stdin),
-# beneath the error that names the step. Git names paths, locks and missing
-# identity there, never file contents.
+# Show up to five of git's own diagnostics from a failed command's stderr (on
+# stdin), beneath the error that names the step. Only fatal:/error:/warning:
+# lines are shown: git writes hook output to stderr too, and a hook (a secret
+# scanner, say) may print file contents. Backslashes are doubled because
+# log_error expands escapes.
 asb_log_git_stderr() {
-    local line shown=0
+    local line shown=0 withheld=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -n "$line" ]] || continue
-        log_error "  git: ${line}"
-        shown=$((shown + 1))
-        (( shown < 5 )) || break
+        case "$line" in
+            fatal:\ * | error:\ * | warning:\ *)
+                if (( shown < 5 )); then
+                    log_error "  git: ${line//\\/\\\\}"
+                    shown=$((shown + 1))
+                fi
+                ;;
+            *) withheld=$((withheld + 1)) ;;
+        esac
     done
+    if (( shown == 0 && withheld > 0 )); then
+        log_error "  (other output withheld; it may come from a git hook)"
+    fi
 }
 
 init_git_repo() {

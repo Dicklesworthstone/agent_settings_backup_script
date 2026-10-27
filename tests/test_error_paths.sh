@@ -46,6 +46,25 @@ test_backup_staging_failure_shows_git_error() {
     assert_contains "$ASB_LAST_OUTPUT" "index.lock" || return 1
 }
 
+test_backup_commit_failure_withholds_hook_output() {
+    create_claude_fixture
+    run_asb backup claude || { echo "Initial backup failed: $ASB_LAST_OUTPUT" >&2; return 1; }
+
+    # Git writes hook output to stderr. A refusing hook (a secret scanner,
+    # say) may echo what it matched; asb must not repeat that.
+    local hook="${ASB_BACKUP_ROOT}/.claude/.git/hooks/pre-commit"
+    printf '#!/bin/sh\necho "matched: asb-test-hook-secret" >&2\nexit 1\n' > "$hook"
+    chmod +x "$hook"
+    printf '{"agent":"claude","setting":false}\n' > "${HOME}/.claude/settings.json"
+    run_asb backup claude
+    if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
+        echo "Expected failure when the pre-commit hook refuses" >&2
+        return 1
+    fi
+    assert_contains "$ASB_LAST_OUTPUT" "Could not create backup commit" || return 1
+    assert_not_contains "$ASB_LAST_OUTPUT" "asb-test-hook-secret" || return 1
+}
+
 test_backup_invalid_agent_name() {
     run_asb backup "agent with spaces"
     if [[ "$ASB_LAST_STATUS" -eq 0 ]]; then
@@ -320,6 +339,7 @@ test_missing_required_args() {
 # Run all tests
 run_test "backup_unknown_agent" test_backup_unknown_agent || true
 run_test "backup_staging_failure_shows_git_error" test_backup_staging_failure_shows_git_error || true
+run_test "backup_commit_failure_withholds_hook_output" test_backup_commit_failure_withholds_hook_output || true
 run_test "backup_invalid_agent_name" test_backup_invalid_agent_name || true
 run_test "restore_unknown_agent" test_restore_unknown_agent || true
 run_test "restore_no_backup_exists" test_restore_no_backup_exists || true
