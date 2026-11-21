@@ -72,7 +72,7 @@ cp asb ~/.local/bin/
 **Verify installation:**
 
 ```bash
-asb version   # Should output: asb version 0.3.7
+asb version   # Should output: asb version 0.3.8
 asb help      # Shows available commands
 ```
 
