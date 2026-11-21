@@ -2223,12 +2223,544 @@ export_backup() {
     return 0
 }
 
-import_backup() {
+asb_is_recognized_agent_folder() {
+    local folder="$1"
+    local candidate
+    for candidate in "${AGENT_FOLDERS[@]}"; do
+        if [[ "$candidate" == "$folder" ]]; then
+            return 0
+        fi
+    done
+    if [[ -n "${DISCOVERY_PATTERNS[$folder]+x}" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Validate every member of a gzip tar archive before extraction.
+# Sets ASB_IMPORT_AGENT_FOLDER on success, or ASB_IMPORT_ERR_CODE and
+# ASB_IMPORT_ERR_MSG on failure.
+asb_validate_import_archive() {
+    local archive_file="$1"
+    ASB_IMPORT_AGENT_FOLDER=""
+    ASB_IMPORT_ERR_CODE=""
+    ASB_IMPORT_ERR_MSG=""
+
+    local detected_root="" err_line=""
+    if command_exists perl && command_exists gzip; then
+        local pl_out="" pl_rc=0
+        pl_out=$(perl -e '
+use strict;
+use warnings;
+
+sub fail_err {
+    my ($code, $msg) = @_;
+    print "ERR:$code:$msg\n";
+    exit 1;
+}
+
+my ($archive_path) = @ARGV;
+open(my $in, "-|", "gzip", "-dc", "--", $archive_path)
+    or fail_err("archive_read_failed", "Failed to read archive");
+binmode($in);
+
+sub norm_rel {
+    my ($p) = @_;
+    my @out;
+    for my $seg (split m{/}, $p) {
+        next if $seg eq "" || $seg eq ".";
+        if ($seg eq "..") {
+            if (@out && $out[-1] ne "..") { pop @out; }
+            else { push @out, ".."; }
+        } else {
+            push @out, $seg;
+        }
+    }
+    return join("/", @out);
+}
+
+sub parse_size {
+    my ($raw) = @_;
+    if (ord(substr($raw, 0, 1)) & 0x80) {
+        my $n = 0;
+        for my $i (1..11) {
+            $n = $n * 256 + ord(substr($raw, $i, 1));
+        }
+        return $n;
+    }
+    $raw =~ s/\0.*$//s;
+    $raw =~ s/^\s+|\s+$//g;
+    return 0 if $raw eq "";
+    fail_err("archive_read_failed", "Failed to read archive") unless $raw =~ /^[0-7]+$/;
+    return oct($raw);
+}
+
+sub read_exact {
+    my ($need) = @_;
+    my $buf = "";
+    while (length($buf) < $need) {
+        my $chunk = "";
+        my $r = read($in, $chunk, $need - length($buf));
+        return undef if !defined($r) || $r == 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+
+sub parse_pax {
+    my ($data) = @_;
+    my %kv;
+    my $pos = 0;
+    my $len = length($data);
+    while ($pos < $len) {
+        my $sp = index($data, " ", $pos);
+        last if $sp < 0;
+        my $rec_len = substr($data, $pos, $sp - $pos);
+        last unless $rec_len =~ /^\d+$/ && $rec_len > 0;
+        my $rec = substr($data, $sp + 1, $pos + $rec_len - $sp - 1);
+        $rec =~ s/\n$//;
+        if ($rec =~ /^([^=]+)=(.*)$/s) {
+            $kv{$1} = $2;
+        }
+        $pos += $rec_len;
+    }
+    return %kv;
+}
+
+my $seen_root;
+my %symlinks;
+my %pax_global;
+my %pax_next;
+my $gnu_longname;
+my $gnu_longlink;
+my $saw_header = 0;
+my $saw_eof = 0;
+
+while (1) {
+    my $hdr = read_exact(512);
+    if (!defined($hdr)) {
+        fail_err("archive_read_failed", "Failed to read archive") unless $saw_header;
+        last;
+    }
+    if ($hdr eq ("\0" x 512)) {
+        $saw_eof = 1;
+        last;
+    }
+    $saw_header = 1;
+
+    # Verify tar header checksum (unsigned or signed byte sum)
+    my $stored_ck = substr($hdr, 148, 8);
+    $stored_ck =~ s/\0.*$//s;
+    $stored_ck =~ s/^\s+|\s+$//g;
+    fail_err("archive_read_failed", "Failed to read archive") unless $stored_ck =~ /^[0-7]+$/;
+    my $want_ck = oct($stored_ck);
+    my $chk_hdr = substr($hdr, 0, 148) . (" " x 8) . substr($hdr, 156);
+    my $usum = unpack("%32C*", $chk_hdr);
+    if ($usum != $want_ck) {
+        my $ssum = 0;
+        for my $b (unpack("c*", $chk_hdr)) { $ssum += $b; }
+        fail_err("archive_read_failed", "Failed to read archive") if $ssum != $want_ck;
+    }
+
+    my $type = substr($hdr, 156, 1);
+    $type = "0" if $type eq "\0";
+    my $size = parse_size(substr($hdr, 124, 12));
+    $size = int($pax_next{size}) if defined($pax_next{size}) && $pax_next{size} =~ /^\d+$/;
+
+    my $pad_size = $size ? (($size + 511) & ~511) : 0;
+
+    if ($type eq "L" || $type eq "K" || $type eq "x" || $type eq "g") {
+        my $payload = $pad_size ? read_exact($pad_size) : "";
+        fail_err("archive_read_failed", "Failed to read archive") unless defined($payload);
+        my $data = substr($payload, 0, $size);
+        if ($type eq "L") {
+            $data =~ s/\0+$//;
+            $gnu_longname = $data;
+        } elsif ($type eq "K") {
+            $data =~ s/\0+$//;
+            $gnu_longlink = $data;
+        } elsif ($type eq "x") {
+            my %kv = parse_pax($data);
+            $pax_next{$_} = $kv{$_} for keys %kv;
+        } elsif ($type eq "g") {
+            my %kv = parse_pax($data);
+            $pax_global{$_} = $kv{$_} for keys %kv;
+        }
+        next;
+    }
+
+    # Skip member data blocks
+    my $rem = $pad_size;
+    while ($rem > 0) {
+        my $step = $rem > 65536 ? 65536 : $rem;
+        my $skip = read_exact($step);
+        fail_err("archive_read_failed", "Failed to read archive") unless defined($skip);
+        $rem -= $step;
+    }
+
+    my $name = substr($hdr, 0, 100);
+    $name =~ s/\0.*$//s;
+    my $prefix = substr($hdr, 345, 155);
+    $prefix =~ s/\0.*$//s;
+    $name = "$prefix/$name" if $prefix ne "";
+    my $linkname = substr($hdr, 157, 100);
+    $linkname =~ s/\0.*$//s;
+
+    $name = $gnu_longname if defined($gnu_longname);
+    $linkname = $gnu_longlink if defined($gnu_longlink);
+    $name = $pax_global{path} if defined($pax_global{path});
+    $name = $pax_next{path} if defined($pax_next{path});
+    $linkname = $pax_global{linkpath} if defined($pax_global{linkpath});
+    $linkname = $pax_next{linkpath} if defined($pax_next{linkpath});
+    %pax_next = ();
+    $gnu_longname = undef;
+    $gnu_longlink = undef;
+
+    # Skip AppleDouble/macOS PAX metadata pseudo-headers if any
+    next if $type eq "X";
+
+    fail_err("unsafe_archive_path", "Archive contains NUL byte in member path") if index($name, "\0") >= 0;
+    fail_err("unsafe_archive_path", "Archive contains absolute path: $name") if $name =~ m{^/};
+
+    my $cleaned = $name;
+    $cleaned =~ s{^(?:\./)+}{};
+    $cleaned =~ s{/+$}{};
+    if ($cleaned eq "" || $cleaned eq ".") {
+        fail_err("invalid_archive_structure", "Archive contains non-directory root entry: $name") unless $type eq "5";
+        next;
+    }
+
+    my @parts = split m{/}, $cleaned, -1;
+    for my $part (@parts) {
+        if ($part eq "" || $part eq "." || $part eq "..") {
+            fail_err("unsafe_archive_path", "Archive contains unsafe path component: $name");
+        }
+    }
+
+    if ($type eq "3" || $type eq "4" || $type eq "6") {
+        fail_err("unsafe_archive_entry", "Archive contains special device or FIFO: $name");
+    }
+    if ($type eq "1") {
+        fail_err("unsafe_archive_entry", "Archive contains unsupported hardlink: $name");
+    }
+
+    my $root = $parts[0];
+    if (@parts == 1 && $type ne "5") {
+        fail_err("invalid_archive_structure", "Archive contains top-level file outside agent directory: $name");
+    }
+    if (!defined($seen_root)) {
+        $seen_root = $root;
+    } elsif ($root ne $seen_root) {
+        fail_err("multiple_archive_roots", "Archive contains entries for multiple roots ($seen_root and $root)");
+    }
+
+    # Refuse any member traversing an earlier symlink
+    my $acc = $parts[0];
+    for my $i (1 .. $#parts - 1) {
+        fail_err("unsafe_archive_path", "Archive traverses symlink path: $name") if $symlinks{$acc};
+        $acc .= "/" . $parts[$i];
+    }
+    fail_err("unsafe_archive_path", "Archive traverses symlink path: $name") if @parts > 1 && $symlinks{$acc};
+
+    if ($type eq "2") {
+        if (@parts >= 2 && $parts[1] eq ".git") {
+            fail_err("untrusted_git_metadata", "Archive contains symlink inside .git: $name");
+        }
+        if ($linkname =~ m{^/}) {
+            fail_err("unsafe_archive_link", "Archive contains symlink with absolute target: $name");
+        }
+        my $parent = @parts > 1 ? join("/", @parts[0 .. $#parts - 1]) : "";
+        my $resolved = norm_rel($parent ne "" ? "$parent/$linkname" : $linkname);
+        if ($resolved ne $seen_root && index($resolved, "$seen_root/") != 0) {
+            fail_err("unsafe_archive_link", "Archive symlink escapes agent directory: $name -> $linkname");
+        }
+        $symlinks{$cleaned} = 1;
+    }
+}
+
+# Drain trailing tar padding so gzip verifies CRC/EOF cleanly.
+# Note: BSD tar -czf - pads stdout to 10KB blocks; gzip exits 2 ("trailing
+# garbage ignored") on trailing zero padding after a complete tar EOF block,
+# whereas corrupt/truncated gzip streams exit 1.
+my $drain = "";
+while (read($in, $drain, 65536)) {}
+my $gz_ok = close($in);
+my $gz_exit = $? >> 8;
+if (!$gz_ok && !($gz_exit == 2 && $saw_eof)) {
+    fail_err("archive_read_failed", "Failed to read archive");
+}
+
+fail_err("invalid_archive_structure", "Archive does not contain a top-level directory") unless defined($seen_root);
+print "OK:$seen_root\n";
+' "$archive_file" 2>/dev/null) || pl_rc=$?
+        if [[ $pl_rc -ne 0 || "$pl_out" != OK:* ]]; then
+            err_line="${pl_out%%$'\n'*}"
+            if [[ "$err_line" == ERR:*:* ]]; then
+                local rest="${err_line#ERR:}"
+                ASB_IMPORT_ERR_CODE="${rest%%:*}"
+                ASB_IMPORT_ERR_MSG="${rest#*:}"
+            else
+                ASB_IMPORT_ERR_CODE="archive_read_failed"
+                ASB_IMPORT_ERR_MSG="Failed to read archive"
+            fi
+            return 1
+        fi
+        detected_root="${pl_out#OK:}"
+    else
+        local archive_list
+        if ! archive_list=$(tar -tzf "$archive_file" 2>/dev/null); then
+            ASB_IMPORT_ERR_CODE="archive_read_failed"
+            ASB_IMPORT_ERR_MSG="Failed to read archive"
+            return 1
+        fi
+        local member cleaned root
+        while IFS= read -r member; do
+            [[ -z "$member" ]] && continue
+            if [[ "$member" == /* ]]; then
+                ASB_IMPORT_ERR_CODE="unsafe_archive_path"
+                ASB_IMPORT_ERR_MSG="Archive contains absolute path: $member"
+                return 1
+            fi
+            cleaned="$member"
+            while [[ "$cleaned" == ./* ]]; do
+                cleaned="${cleaned#./}"
+            done
+            cleaned="${cleaned%/}"
+            [[ -z "$cleaned" || "$cleaned" == "." ]] && continue
+            if [[ "$cleaned" == ".." || "$cleaned" == ../* || "$cleaned" == */.. || "$cleaned" == */../* ]]; then
+                ASB_IMPORT_ERR_CODE="unsafe_archive_path"
+                ASB_IMPORT_ERR_MSG="Archive contains unsafe path component: $member"
+                return 1
+            fi
+            if [[ "$cleaned" != */* && "$member" != */ ]]; then
+                ASB_IMPORT_ERR_CODE="invalid_archive_structure"
+                ASB_IMPORT_ERR_MSG="Archive contains top-level file outside agent directory: $member"
+                return 1
+            fi
+            root="${cleaned%%/*}"
+            if [[ -z "$detected_root" ]]; then
+                detected_root="$root"
+            elif [[ "$root" != "$detected_root" ]]; then
+                ASB_IMPORT_ERR_CODE="multiple_archive_roots"
+                ASB_IMPORT_ERR_MSG="Archive contains entries for multiple roots ($detected_root and $root)"
+                return 1
+            fi
+        done <<< "$archive_list"
+        if [[ -z "$detected_root" ]]; then
+            ASB_IMPORT_ERR_CODE="invalid_archive_structure"
+            ASB_IMPORT_ERR_MSG="Archive does not contain a top-level directory"
+            return 1
+        fi
+        local verbose_list
+        if verbose_list=$(tar -tvzf "$archive_file" 2>/dev/null); then
+            if printf '%s\n' "$verbose_list" | grep -qE '^[hbcp]'; then
+                ASB_IMPORT_ERR_CODE="unsafe_archive_entry"
+                ASB_IMPORT_ERR_MSG="Archive contains unsupported link or device entry"
+                return 1
+            fi
+        fi
+    fi
+
+    if [[ "$detected_root" == "." || "$detected_root" == ".." || "$detected_root" == *"/"* ]]; then
+        ASB_IMPORT_ERR_CODE="invalid_archive_root"
+        ASB_IMPORT_ERR_MSG="Invalid archive root: ${detected_root}"
+        return 1
+    fi
+    if ! asb_is_recognized_agent_folder "$detected_root"; then
+        ASB_IMPORT_ERR_CODE="unrecognized_agent_root"
+        ASB_IMPORT_ERR_MSG="Unrecognized agent directory in archive: ${detected_root}"
+        return 1
+    fi
+
+    ASB_IMPORT_AGENT_FOLDER="$detected_root"
+    return 0
+}
+
+# Enforce imported Git repository integrity and metadata trust policy before
+# publishing an imported archive into the live backup root.
+asb_validate_imported_git_repo() {
+    local staged_repo="$1"
+    ASB_IMPORT_ERR_CODE=""
+    ASB_IMPORT_ERR_MSG=""
+
+    if [[ ! -d "$staged_repo" || -L "$staged_repo" ]]; then
+        ASB_IMPORT_ERR_CODE="invalid_archive_structure"
+        ASB_IMPORT_ERR_MSG="Extracted backup root is missing or not a directory"
+        return 1
+    fi
+    if [[ ! -d "$staged_repo/.git" || -L "$staged_repo/.git" ]]; then
+        ASB_IMPORT_ERR_CODE="invalid_git_repository"
+        ASB_IMPORT_ERR_MSG="Imported archive does not contain a valid .git directory"
+        return 1
+    fi
+
+    if command_exists perl; then
+        local git_check_out="" git_check_rc=0
+        git_check_out=$(perl -e '
+use strict;
+use warnings;
+my ($git_dir) = @ARGV;
+sub fail_meta { print "ERR:$_[0]:$_[1]\n"; exit 1; }
+
+# 1) Walk .git with zero external modules; forbid any symlinks inside .git
+my @stack = ($git_dir);
+while (@stack) {
+    my $dir = pop @stack;
+    opendir(my $dh, $dir) or fail_meta("invalid_git_repository", "Cannot read .git directory");
+    while (defined(my $e = readdir($dh))) {
+        next if $e eq "." || $e eq "..";
+        my $p = "$dir/$e";
+        fail_meta("untrusted_git_metadata", "Imported repository contains a symlink inside .git") if -l $p;
+        push @stack, $p if -d $p;
+    }
+    closedir($dh);
+}
+
+# 2) Reject any non-.sample hook file under .git/hooks
+my $hooks_dir = "$git_dir/hooks";
+if (-d $hooks_dir) {
+    opendir(my $hd, $hooks_dir) or fail_meta("untrusted_git_metadata", "Cannot read .git/hooks");
+    while (defined(my $e = readdir($hd))) {
+        next if $e eq "." || $e eq ".." || $e =~ /\.sample$/;
+        fail_meta("untrusted_git_metadata", "Imported repository contains untrusted Git hook: $e");
+    }
+    closedir($hd);
+}
+
+# 3) Inspect .git/config directly for executable or redirecting directives
+my $cfg = "$git_dir/config";
+if (-f $cfg) {
+    open(my $fh, "<", $cfg) or fail_meta("untrusted_git_metadata", "Imported repository has unreadable .git/config");
+    my $section = "";
+    while (my $line = <$fh>) {
+        $line =~ s/\r?\n$//;
+        $line =~ s/^\s+//;
+        next if $line eq "" || $line =~ /^[#;]/;
+        if ($line =~ /^\[([A-Za-z0-9.-]+)(?:\s+"([^"]*)")?\]/) {
+            $section = lc($1);
+            next;
+        }
+        if ($line =~ /^([A-Za-z0-9-]+)\s*(?:=|$)/) {
+            my $k = lc($1);
+            my $full = $section ne "" ? "$section.$k" : $k;
+            if (
+                $full =~ /^core\.(hookspath|fsmonitor|sshcommand|askpass|pager|editor|gitproxy|worktree|alternate)$/ ||
+                $section eq "credential" ||
+                $section eq "alias" ||
+                $section eq "include" ||
+                $section eq "includeif" ||
+                ($section eq "filter" && $k =~ /^(clean|smudge|process)$/) ||
+                ($section eq "diff" && $k =~ /^(textconv|command)$/) ||
+                ($section eq "http" && $k =~ /^proxy/) ||
+                $section eq "uploadpack" ||
+                $section eq "receivepack"
+            ) {
+                fail_meta("untrusted_git_metadata", "Imported repository contains untrusted Git config directive: $full");
+            }
+        }
+    }
+    close($fh);
+}
+print "OK\n";
+' "$staged_repo/.git" 2>&1) || git_check_rc=$?
+        if [[ $git_check_rc -ne 0 || "$git_check_out" != "OK" ]]; then
+            local err_line="${git_check_out%%$'\n'*}"
+            if [[ "$err_line" == ERR:*:* ]]; then
+                local rest="${err_line#ERR:}"
+                ASB_IMPORT_ERR_CODE="${rest%%:*}"
+                ASB_IMPORT_ERR_MSG="${rest#*:}"
+            else
+                ASB_IMPORT_ERR_CODE="untrusted_git_metadata"
+                ASB_IMPORT_ERR_MSG="Imported repository metadata validation failed"
+            fi
+            return 1
+        fi
+    else
+        local git_symlink
+        git_symlink=$(find "$staged_repo/.git" -type l -print -quit 2>/dev/null || true)
+        if [[ -n "$git_symlink" ]]; then
+            ASB_IMPORT_ERR_CODE="untrusted_git_metadata"
+            ASB_IMPORT_ERR_MSG="Imported repository contains a symlink inside .git"
+            return 1
+        fi
+        # Reject active (non-.sample) hooks inside imported .git/hooks
+        if [[ -d "$staged_repo/.git/hooks" ]]; then
+            local hook_entry hook_name
+            for hook_entry in "$staged_repo/.git/hooks"/* "$staged_repo/.git/hooks"/.[!.]* "$staged_repo/.git/hooks"/..?*; do
+                [[ -e "$hook_entry" || -L "$hook_entry" ]] || continue
+                hook_name="${hook_entry##*/}"
+                [[ "$hook_name" == *.sample ]] && continue
+                ASB_IMPORT_ERR_CODE="untrusted_git_metadata"
+                ASB_IMPORT_ERR_MSG="Imported repository contains untrusted Git hook: ${hook_name}"
+                return 1
+            done
+        fi
+        # Reject executable or redirecting directives in imported .git/config
+        if [[ -f "$staged_repo/.git/config" ]]; then
+            local config_keys key
+            if ! config_keys=$(git config --file "$staged_repo/.git/config" --list --name-only 2>/dev/null); then
+                ASB_IMPORT_ERR_CODE="untrusted_git_metadata"
+                ASB_IMPORT_ERR_MSG="Imported repository has unreadable .git/config"
+                return 1
+            fi
+            while IFS= read -r key; do
+                [[ -z "$key" ]] && continue
+                case "${key,,}" in
+                    core.hookspath|core.fsmonitor|core.sshcommand|core.askpass|core.pager|core.editor|core.gitproxy|core.worktree|core.alternate|credential.*|filter.*.clean|filter.*.smudge|filter.*.process|diff.*.textconv|diff.*.command|alias.*|include.path|includeif.*|http.proxy*|uploadpack.*|receivepack.*)
+                        ASB_IMPORT_ERR_CODE="untrusted_git_metadata"
+                        ASB_IMPORT_ERR_MSG="Imported repository contains untrusted Git config directive: ${key}"
+                        return 1
+                        ;;
+                esac
+            done <<< "$config_keys"
+        fi
+    fi
+
+    if ! git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$staged_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        ASB_IMPORT_ERR_CODE="invalid_git_repository"
+        ASB_IMPORT_ERR_MSG="Imported archive is not a valid Git repository"
+        return 1
+    fi
+
+    return 0
+}
+
+import_backup() (
     local archive="$1"
     local backup_root
     backup_root=$(get_backup_root)
 
-    if [[ "$archive" != "-" ]] && [[ ! -f "$archive" ]]; then
+    local spool_file=""
+    local stage_dir=""
+    local prev_dir=""
+    # shellcheck disable=SC2329 # Invoked via EXIT trap below
+    cleanup_import_temps() {
+        [[ -n "$spool_file" ]] && rm -f -- "$spool_file" 2>/dev/null || true
+        [[ -n "$stage_dir" ]] && rm -rf -- "$stage_dir" 2>/dev/null || true
+        [[ -n "$prev_dir" ]] && rm -rf -- "$prev_dir" 2>/dev/null || true
+    }
+    trap cleanup_import_temps EXIT
+
+    local work_archive="$archive"
+    if [[ "$archive" == "-" ]]; then
+        if ! spool_file=$(mktemp "${TMPDIR:-/tmp}/asb-import-stdin.XXXXXXXXXX" 2>/dev/null || mktemp -t asb-import-stdin.XXXXXXXX); then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"spool_failed\",\"message\":\"Could not create temporary file for stdin archive\"}"
+            else
+                log_error "Could not create temporary file for stdin archive"
+            fi
+            return 1
+        fi
+        if ! cat > "$spool_file"; then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"archive_read_failed\",\"archive\":\"-\"}"
+            else
+                log_error "Failed to read archive from stdin"
+            fi
+            return 1
+        fi
+        work_archive="$spool_file"
+    elif [[ ! -f "$archive" ]]; then
         if is_json_output; then
             json_output "{\"status\":\"error\",\"error\":\"archive_not_found\",\"archive\":\"$(json_escape_string "$archive")\"}"
         else
@@ -2237,58 +2769,35 @@ import_backup() {
         return 1
     fi
 
-    # Peek at archive to detect agent folder (needed for dry-run and JSON too)
+    # Validate every archive member uniformly for both file and stdin inputs
     local agent_folder=""
-    if [[ "$archive" != "-" ]]; then
-        local archive_list
-        if ! archive_list=$(tar -tzf "$archive" 2>/dev/null); then
-            if is_json_output; then
-                json_output "{\"status\":\"error\",\"error\":\"archive_read_failed\",\"archive\":\"$(json_escape_string "$archive")\"}"
-            else
-                log_error "Failed to read archive"
-            fi
-            return 1
+    if ! asb_validate_import_archive "$work_archive"; then
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"$(json_escape_string "$ASB_IMPORT_ERR_CODE")\",\"archive\":\"$(json_escape_string "$archive")\",\"message\":\"$(json_escape_string "$ASB_IMPORT_ERR_MSG")\"}"
+        else
+            log_error "${ASB_IMPORT_ERR_MSG}"
         fi
-        agent_folder=$(printf '%s\n' "$archive_list" | awk -F/ '{ gsub(/^\.\//, "", $0); if (NF > 1 && $1 != "" && $1 != ".") { print $1; exit } }')
-        if [[ -z "$agent_folder" ]]; then
-            if is_json_output; then
-                json_output "{\"status\":\"error\",\"error\":\"invalid_archive_structure\",\"message\":\"Archive does not contain a top-level directory\"}"
-            else
-                log_error "Archive does not contain a top-level directory"
-            fi
-            return 1
-        fi
-        if [[ "$agent_folder" == "." || "$agent_folder" == ".." || "$agent_folder" == *"/"* ]]; then
-            if is_json_output; then
-                json_output "{\"status\":\"error\",\"error\":\"invalid_archive_root\",\"folder\":\"$(json_escape_string "$agent_folder")\"}"
-            else
-                log_error "Invalid archive root: ${agent_folder}"
-            fi
-            return 1
-        fi
+        return 1
     fi
+    agent_folder="$ASB_IMPORT_AGENT_FOLDER"
 
-    # Dry-run mode
+    # Dry-run mode (same validated metadata for both file and stdin)
     if [[ "$DRY_RUN" == "true" ]]; then
         local would_overwrite=false
-        if [[ -n "$agent_folder" ]] && [[ -d "$backup_root/$agent_folder" ]]; then
+        if [[ -n "$agent_folder" ]] && [[ -e "$backup_root/$agent_folder" || -L "$backup_root/$agent_folder" ]]; then
             would_overwrite=true
         fi
         if is_json_output; then
             local result
             result="{\"status\":\"dry_run\",\"archive\":\"$(json_escape_string "$archive")\",\"destination\":\"$(json_escape_string "$backup_root")\""
-            if [[ -n "$agent_folder" ]]; then
-                result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
-            fi
+            result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
             result+=",\"would_overwrite\":${would_overwrite}}"
             json_output "$result"
         else
             log_info "[DRY RUN] Would import from ${archive}"
             log_info "[DRY RUN] Destination: ${backup_root}"
-            if [[ "$archive" != "-" ]]; then
-                log_info "[DRY RUN] Archive contents:"
-                tar -tzf "$archive" 2>/dev/null | head -10
-            fi
+            log_info "[DRY RUN] Archive contents:"
+            tar -tzf "$work_archive" 2>/dev/null | head -10
             if [[ "$would_overwrite" == "true" ]]; then
                 log_info "[DRY RUN] Would overwrite existing backup: $backup_root/$agent_folder"
             fi
@@ -2301,23 +2810,42 @@ import_backup() {
     fi
 
     # Create backup location if needed
-    mkdir -p "$backup_root"
+    mkdir -p "$backup_root" || {
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"backup_root_failed\"}"
+        else
+            log_error "Failed to create backup root: ${backup_root}"
+        fi
+        return 1
+    }
 
-    # Held until asb exits.
-    if [[ -n "$agent_folder" ]] && ! asb_lock_backup "$agent_folder"; then
+    # Acquire per-agent writer lock (released automatically when subshell exits)
+    if ! asb_lock_backup "$agent_folder"; then
         is_json_output && json_output "{\"status\":\"error\",\"error\":\"locked\"}"
         return 1
     fi
 
-    # Check for existing backup (conflict detection)
-    if [[ -n "$agent_folder" ]] && [[ -d "$backup_root/$agent_folder" ]]; then
+    local target_dir="${backup_root}/${agent_folder}"
+    if [[ -L "$target_dir" ]]; then
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"unsafe_destination\",\"folder\":\"$(json_escape_string "$target_dir")\"}"
+        else
+            log_error "Refusing to replace symlink backup destination: ${target_dir}"
+        fi
+        return 1
+    fi
+
+    # Check for existing backup (conflict detection — now enforced for stdin too)
+    local has_incumbent=false
+    if [[ -e "$target_dir" ]]; then
+        has_incumbent=true
         if [[ "$FORCE" != "true" ]]; then
             if is_json_output; then
-                json_output "{\"status\":\"error\",\"error\":\"backup_exists\",\"folder\":\"$(json_escape_string "$backup_root/$agent_folder")\",\"message\":\"Use --force to overwrite existing backup\"}"
+                json_output "{\"status\":\"error\",\"error\":\"backup_exists\",\"folder\":\"$(json_escape_string "$target_dir")\",\"message\":\"Use --force to overwrite existing backup\"}"
                 return 1
             fi
 
-            log_warn "Backup already exists: $backup_root/$agent_folder"
+            log_warn "Backup already exists: $target_dir"
 
             if [[ -t 0 ]]; then
                 printf 'Overwrite existing backup? [y/N] ' >&2
@@ -2337,17 +2865,21 @@ import_backup() {
                 return 1
             fi
         fi
+    fi
 
-        rm -rf -- "${backup_root:?}/${agent_folder:?}"
+    # Extract and validate into a staging directory on the SAME filesystem
+    # before touching any existing incumbent backup.
+    if ! stage_dir=$(mktemp -d "${backup_root}/.asb-import-stage.XXXXXXXX"); then
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"staging_failed\"}"
+        else
+            log_error "Failed to create import staging directory"
+        fi
+        return 1
     fi
 
     local tar_exit=0
-    if [[ "$archive" == "-" ]]; then
-        tar -xzf - -C "$backup_root" 2>/dev/null || tar_exit=$?
-    else
-        tar -xzf "$archive" -C "$backup_root" 2>/dev/null || tar_exit=$?
-    fi
-
+    tar -xzf "$work_archive" -C "$stage_dir" 2>/dev/null || tar_exit=$?
     if [[ $tar_exit -ne 0 ]]; then
         if is_json_output; then
             json_output "{\"status\":\"error\",\"error\":\"extract_failed\"}"
@@ -2357,12 +2889,81 @@ import_backup() {
         return 1
     fi
 
+    # Confirm staging contains only the expected single agent directory
+    local stage_entry stage_count=0
+    for stage_entry in "$stage_dir"/* "$stage_dir"/.[!.]* "$stage_dir"/..?*; do
+        [[ -e "$stage_entry" || -L "$stage_entry" ]] || continue
+        ((stage_count++))
+        if [[ "${stage_entry##*/}" != "$agent_folder" ]]; then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"multiple_archive_roots\",\"message\":\"Archive extracted unexpected top-level entry\"}"
+            else
+                log_error "Archive extracted unexpected top-level entry: ${stage_entry##*/}"
+            fi
+            return 1
+        fi
+    done
+    if [[ $stage_count -ne 1 ]]; then
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"invalid_archive_structure\"}"
+        else
+            log_error "Archive did not extract the expected agent directory: ${agent_folder}"
+        fi
+        return 1
+    fi
+
+    # Enforce Git integrity & metadata trust policy before publishing
+    if ! asb_validate_imported_git_repo "$stage_dir/$agent_folder"; then
+        if is_json_output; then
+            json_output "{\"status\":\"error\",\"error\":\"$(json_escape_string "$ASB_IMPORT_ERR_CODE")\",\"message\":\"$(json_escape_string "$ASB_IMPORT_ERR_MSG")\"}"
+        else
+            log_error "${ASB_IMPORT_ERR_MSG}"
+        fi
+        return 1
+    fi
+
+    # Atomically swap staged candidate into place, rolling back incumbent on error
+    if [[ "$has_incumbent" == "true" ]]; then
+        if ! prev_dir=$(mktemp -d "${backup_root}/.asb-import-prev.XXXXXXXX"); then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"publish_failed\"}"
+            else
+                log_error "Failed to create incumbent backup directory during import"
+            fi
+            return 1
+        fi
+        if ! mv -- "$target_dir" "$prev_dir/$agent_folder"; then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"publish_failed\"}"
+            else
+                log_error "Failed to preserve existing backup before import swap"
+            fi
+            return 1
+        fi
+        if ! mv -- "$stage_dir/$agent_folder" "$target_dir"; then
+            mv -- "$prev_dir/$agent_folder" "$target_dir" 2>/dev/null || true
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"publish_failed\"}"
+            else
+                log_error "Failed to publish imported backup; previous backup restored"
+            fi
+            return 1
+        fi
+    else
+        if ! mv -- "$stage_dir/$agent_folder" "$target_dir"; then
+            if is_json_output; then
+                json_output "{\"status\":\"error\",\"error\":\"publish_failed\"}"
+            else
+                log_error "Failed to publish imported backup"
+            fi
+            return 1
+        fi
+    fi
+
     if is_json_output; then
         local result
         result="{\"status\":\"success\",\"destination\":\"$(json_escape_string "$backup_root")\""
-        if [[ -n "$agent_folder" ]]; then
-            result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
-        fi
+        result+=",\"agent_folder\":\"$(json_escape_string "$agent_folder")\""
         result+="}"
         json_output "$result"
     else
@@ -2372,7 +2973,7 @@ import_backup() {
     fi
 
     return 0
-}
+)
 
 #==============================================================================
 # LIST / STATUS
