@@ -268,10 +268,20 @@ install_from_latest_release() {
     install_script "$temp_dir/$SCRIPT_NAME" "$install_dir"
 }
 
+installer_needs_sudo() {
+    local install_dir="$1"
+    local uid="${2:-${EUID:-$(id -u)}}"
+    [[ "$install_dir" == "/usr/local/bin" && "$uid" -ne 0 ]]
+}
+
 install_script() {
     local source="$1"
     local install_dir="$2"
     local dest="$install_dir/$SCRIPT_NAME"
+    local use_sudo=0
+    if installer_needs_sudo "$install_dir"; then
+        use_sudo=1
+    fi
 
     if [[ -L "$dest" || ( -e "$dest" && ! -f "$dest" ) ]]; then
         log_error "Refusing to replace a non-regular or symlink destination: $dest"
@@ -281,7 +291,7 @@ install_script() {
     # Create directory if needed
     if [[ ! -d "$install_dir" ]]; then
         log_step "Creating directory: $install_dir"
-        if [[ "$install_dir" == "/usr/local/bin" ]]; then
+        if [[ "$use_sudo" -eq 1 ]]; then
             if ! command_exists sudo; then
                 log_error "sudo is required to create $install_dir"
                 return 1
@@ -307,9 +317,6 @@ install_script() {
 use strict;
 use warnings;
 use Fcntl qw(:DEFAULT :flock S_ISREG O_NOFOLLOW);
-use File::Temp qw(tempfile);
-use File::Copy qw(copy);
-use Digest::SHA;
 
 my ($source, $directory, $name) = @ARGV;
 my $destination = "$directory/$name";
@@ -324,13 +331,59 @@ my @lock_path_stat = lstat($lock_path);
 @lock_path_stat && $lock_stat[0] == $lock_path_stat[0] && $lock_stat[1] == $lock_path_stat[1]
     or die "Installer lock path changed\n";
 
+my $has_digest_sha = eval { require Digest::SHA; 1 } ? 1 : 0;
+
+sub make_temp_file {
+    my ($dir, $prefix) = @_;
+    my @chars = ('A'..'Z', 'a'..'z', '0'..'9');
+    for my $attempt (1..128) {
+        my $suffix = join("", map { $chars[int(rand(@chars))] } 1..6);
+        my $path = "$dir/$prefix.$suffix";
+        if (sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)) {
+            return ($fh, $path);
+        }
+    }
+    die "Cannot create temporary file in $dir: $!\n";
+}
+
+sub copy_handle {
+    my ($src_fh, $dst_fh) = @_;
+    my $buf = "";
+    while (1) {
+        my $n = sysread($src_fh, $buf, 65536);
+        return 0 unless defined($n);
+        last if $n == 0;
+        my $off = 0;
+        while ($off < $n) {
+            my $w = syswrite($dst_fh, $buf, $n - $off, $off);
+            return 0 if !defined($w) || $w <= 0;
+            $off += $w;
+        }
+    }
+    return 1;
+}
+
 sub digest {
     my ($path) = @_;
     sysopen(my $file, $path, O_RDONLY | O_NOFOLLOW) or die "Cannot read $path: $!\n";
     binmode($file) or die "Cannot read raw bytes from $path: $!\n";
-    my $sha = Digest::SHA->new(256)->addfile($file)->hexdigest;
+    if ($has_digest_sha) {
+        my $sha = Digest::SHA->new(256)->addfile($file)->hexdigest;
+        close($file) or die "Cannot close $path: $!\n";
+        return $sha;
+    }
+    my $out = "";
+    my $pid = open(my $pipe, "-|");
+    die "Cannot fork checksum tool: $!\n" unless defined($pid);
+    if ($pid == 0) {
+        open(STDIN, "<&", $file) or exit 127;
+        exec("sha256sum") or exec("shasum", "-a", "256") or exit 127;
+    }
+    while (my $line = <$pipe>) { $out .= $line; }
+    my $ok = close($pipe);
     close($file) or die "Cannot close $path: $!\n";
-    return $sha;
+    die "Checksum command failed for $path\n" unless $ok && $out =~ /^([0-9a-fA-F]{64})\b/;
+    return lc($1);
 }
 
 my @incumbent = lstat($destination);
@@ -355,10 +408,10 @@ sysopen(my $input, $source, O_RDONLY | O_NOFOLLOW) or die "Cannot read source $s
 binmode($input) or die "Cannot read raw installer source: $!\n";
 my @input_stat = stat($input);
 @input_stat && S_ISREG($input_stat[2]) or die "Installer source is not a regular file\n";
-my ($candidate_file, $candidate) = tempfile(".$name-install.XXXXXX", DIR => $directory, UNLINK => 0);
+my ($candidate_file, $candidate) = make_temp_file($directory, ".$name-install");
 binmode($candidate_file) or die "Cannot prepare raw installer bytes: $!\n";
 print STDERR "Retaining prepared installer file: $candidate\n";
-copy($input, $candidate_file) or die "Cannot prepare installer file $candidate: $!\n";
+copy_handle($input, $candidate_file) or die "Cannot prepare installer file $candidate: $!\n";
 close($input) or die "Cannot close installer source: $!\n";
 close($candidate_file) or die "Cannot finish installer file $candidate: $!\n";
 chmod(0755, $candidate) == 1 or die "Cannot set installer permissions: $!\n";
@@ -374,9 +427,9 @@ if (@incumbent && !$same_bytes) {
     my @opened = stat($previous);
     @opened && $opened[0] == $incumbent[0] && $opened[1] == $incumbent[1]
         or die "Incumbent changed before preservation\n";
-    (my $backup_file, $backup) = tempfile(".$name-previous.XXXXXX", DIR => $directory, UNLINK => 0);
+    (my $backup_file, $backup) = make_temp_file($directory, ".$name-previous");
     binmode($backup_file) or die "Cannot preserve raw incumbent bytes: $!\n";
-    copy($previous, $backup_file) or die "Cannot preserve incumbent $backup: $!\n";
+    copy_handle($previous, $backup_file) or die "Cannot preserve incumbent $backup: $!\n";
     close($previous) or die "Cannot close incumbent: $!\n";
     close($backup_file) or die "Cannot finish incumbent backup: $!\n";
     chmod($incumbent[2] & 0777, $backup) == 1 or die "Cannot preserve incumbent permissions: $!\n";
@@ -415,7 +468,11 @@ PERL
     ) || return 1
 
     log_step "Installing to $dest"
-    if [[ "$install_dir" == "/usr/local/bin" ]]; then
+    if [[ "$use_sudo" -eq 1 ]]; then
+        if ! command_exists sudo; then
+            log_error "sudo is required to install to $install_dir"
+            return 1
+        fi
         if ! sudo "$perl_bin" -e "$publisher" "$source" "$install_dir" "$SCRIPT_NAME"; then
             log_error "Failed to install asb to $dest; prepared files and incumbent retained"
             return 1
